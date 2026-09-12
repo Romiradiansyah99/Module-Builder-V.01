@@ -1,0 +1,20 @@
+# Rahasia TIDAK PERNAH masuk image (dipasok lewat env_file compose)
+.env
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+
+# Data runtime (hidup di volume, bukan image)
+output/
+runtime/
+database/uploads/
+*.log
+
+# VCS & artefak lokal
+.git/
+.gitignore
+tools/index.prev-round6b.html
+tools/*.py.orig

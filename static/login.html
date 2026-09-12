@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Login — Module Builder</title>
+<style>
+  :root{
+    --bg:#fbfbfd; --surface:#ffffff; --side:#f5f5f7;
+    --text:#1d1d1f; --muted:#6e6e73;
+    --hairline:rgba(0,0,0,.10); --input-border:rgba(0,0,0,.16);
+    --accent:#0a8a4e; --accent-down:#077541; --accent-soft:rgba(10,138,78,.09);
+    --ring:rgba(10,138,78,.22);
+    --shadow-1:0 1px 3px rgba(0,0,0,.06),0 4px 16px rgba(0,0,0,.06);
+    --ease:cubic-bezier(.3,.15,.25,1);
+  }
+  *{margin:0;padding:0;box-sizing:border-box}
+  body{
+    font-family:-apple-system,BlinkMacSystemFont,"SF Pro Text","Segoe UI",system-ui,Roboto,"Helvetica Neue",Arial,sans-serif;
+    background:var(--bg); color:var(--text);
+    min-height:100vh; display:flex; align-items:center; justify-content:center; padding:24px;
+    -webkit-font-smoothing:antialiased;
+  }
+  .card{
+    width:100%; max-width:400px; background:var(--surface);
+    border:1px solid var(--hairline); border-radius:20px;
+    box-shadow:var(--shadow-1); padding:36px 32px 30px;
+  }
+  .mark{
+    width:52px; height:52px; border-radius:14px; margin:0 auto 18px;
+    background:linear-gradient(135deg,#3ddc7a,#0a8a4e);
+    display:flex; align-items:center; justify-content:center;
+    box-shadow:0 4px 12px rgba(10,138,78,.28);
+  }
+  .mark svg{width:26px; height:26px; fill:#fff}
+  h1{font-size:21px; font-weight:700; text-align:center; letter-spacing:-.02em}
+  p.sub{font-size:13.5px; color:var(--muted); text-align:center; margin:6px 0 24px; line-height:1.5}
+  label{display:block; font-size:12.5px; font-weight:600; color:var(--muted); margin-bottom:6px}
+  input[type=password]{
+    width:100%; font:inherit; font-size:15px; color:var(--text);
+    background:var(--side); border:1px solid var(--input-border);
+    border-radius:10px; padding:11px 13px; outline:none; transition:border-color .2s var(--ease), box-shadow .2s var(--ease);
+  }
+  input[type=password]:focus{outline:none; border-color:var(--accent); box-shadow:0 0 0 3px var(--ring)}
+  button{
+    width:100%; margin-top:16px; font:inherit; font-size:15px; font-weight:600;
+    color:#fff; background:var(--accent); border:none; border-radius:10px;
+    padding:12px; cursor:pointer; transition:background .2s var(--ease), transform .15s var(--ease);
+  }
+  button:hover{background:var(--accent-down)}
+  button:active{transform:scale(.985)}
+  button:disabled{opacity:.55; cursor:default}
+  .err{
+    display:none; margin-top:12px; font-size:13px; color:#b42318;
+    background:rgba(180,35,24,.08); border:1px solid rgba(180,35,24,.25);
+    border-radius:8px; padding:9px 12px; line-height:1.4;
+  }
+  .foot{margin-top:22px; text-align:center; font-size:11.5px; color:var(--muted)}
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="mark">
+    <!-- daun -->
+    <svg viewBox="0 0 24 24"><path d="M17.6 3.2c-5.9.5-9.8 2.7-12 6.1-1.7 2.6-2 5.5-1.4 7.9.2.6.4 1.1.6 1.5l1.8-1.8c-.2-1.9.2-4 1.5-5.9 1.7-2.6 4.8-4.4 9.5-5-.5 4.7-2.3 7.8-4.9 9.5-1.9 1.3-4 1.7-5.9 1.5l-1.8 1.8c.4.2.9.4 1.5.6 2.4.6 5.3.3 7.9-1.4 3.4-2.2 5.6-6.1 6.1-12 .1-.9-.6-1.6-1.5-1.5-.5 0-1 .1-1.4.2z"/></svg>
+  </div>
+  <h1>Module Builder</h1>
+  <p class="sub">Kemnaker &middot; IGJS<br>Masukkan kata sandi tim untuk melanjutkan.</p>
+  <form id="f" autocomplete="off">
+    <label for="pw">Kata sandi</label>
+    <input id="pw" type="password" placeholder="&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;" required>
+    <button id="btn" type="submit">Masuk</button>
+    <div class="err" id="err"></div>
+  </form>
+  <div class="foot">Module Builder &middot; Kemnaker &middot; IGJS</div>
+</div>
+<script>
+const form = document.getElementById("f");
+const pw = document.getElementById("pw");
+const btn = document.getElementById("btn");
+const err = document.getElementById("err");
+
+form.addEventListener("submit", async (e) => {
+  e.preventDefault();
+  err.style.display = "none";
+  btn.disabled = true;
+  btn.textContent = "Memeriksa…";
+  try {
+    const r = await fetch("/api/login", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({password: pw.value}),
+    });
+    if (r.ok) {
+      location.href = "/";
+      return;
+    }
+    let msg = "Kata sandi salah.";
+    try { const d = await r.json(); if (d && d.detail) msg = d.detail; } catch (_) {}
+    err.textContent = msg;
+    err.style.display = "block";
+  } catch (_) {
+    err.textContent = "Tidak bisa menghubungi server.";
+    err.style.display = "block";
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "Masuk";
+  }
+});
+pw.focus();
+</script>
+</body>
+</html>

@@ -1,0 +1,21 @@
+# Secrets & environment
+.env
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Runtime data (sesi, checkpoint, memori AI, upload user, hasil generate)
+runtime/
+output/
+database/uploads/
+database/ai_memory.json
+*.log
+
+# Index vector RAG dibangun ulang otomatis saat server pertama jalan
+database/chroma_db/
+
+# OS
+Thumbs.db
+.DS_Store

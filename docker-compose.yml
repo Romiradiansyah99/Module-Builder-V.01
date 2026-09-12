@@ -1,0 +1,35 @@
+# ============================================================
+# Kemnaker Module Builder — stack produksi VPS
+# ============================================================
+# Jalankan: docker compose build && docker compose up -d
+# Log:      docker compose logs -f
+# Rahasia di .env (env_file) — TIDAK pernah dibaked ke image.
+#
+# HTTPS: tambahkan service Caddy (lihat DEPLOY.md) lalu set
+# COOKIE_SECURE=1 di .env.
+services:
+  app:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      # Bind di dalam kontainer selalu 0.0.0.0 (dipublikasikan lewat ports)
+      HOST: 0.0.0.0
+      PORT: "8000"
+      # Semua state runtime menempel ke volume ./runtime agar selamat
+      # restart/rebuild: uploads, output docx, checkpoint sqlite, sesi,
+      # ai_memory, dan cache model ONNX embedder.
+      OUTPUT_DIR: runtime/output
+      UPLOADS_DIR: runtime/uploads
+      AI_MEMORY_PATH: runtime/ai_memory.json
+      CHECKPOINT_DB: runtime/checkpoints.sqlite
+      SESSIONS_FILE: runtime/sessions.json
+      # PENTING: biarkan EMBEDDING_MODEL kosong di .env agar dipakai
+      # embedder lokal ONNX yang COCOK dengan index chroma_db shipped.
+      # Mengisi kandidat remote = RAG terdegradasi senyap.
+    ports:
+      # Hanya localhost: HTTPS di belakang Caddy (service caddy di bawah).
+      # Tanpa HTTPS/Caddy: ganti menjadi "8000:8000".
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - ./runtime:/app/runtime

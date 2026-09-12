@@ -1,0 +1,5 @@
+# Ganti domain-anda.com dengan domain tim, point DNS A record ke IP VPS.
+domain-anda.com {
+    reverse_proxy app:8000
+    flush_interval -1
+}
