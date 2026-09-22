@@ -69,12 +69,15 @@ from tools.llm_config import (
 )
 from tools.session_store import load as load_sessions
 from tools.session_store import save as save_sessions
+from rag.threads import THREADS as RAG_THREADS
 
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     """Ingest RAG SKKNI sekali di thread belakang saat server menyala."""
     threading.Thread(target=_ingest_background, daemon=True).start()
+    # RAG chat: auto-index program docx aktif (best-effort, tidak memblokir).
+    threading.Thread(target=_ingest_rag_background, daemon=True).start()
     yield
 
 
@@ -174,6 +177,18 @@ def _ingest_background():
         print(f"[server] RAG ingest GAGAL: {exc}")
 
 
+def _ingest_rag_background():
+    """Auto-index program docx aktif utk RAG chat (best-effort)."""
+    try:
+        from rag.document_manager import ingest_program
+
+        rec = ingest_program()
+        if rec:
+            print(f"[server] RAG chat siap (program: {rec.get('chunk_count', 0)} chunk).")
+    except Exception as exc:  # noqa: BLE001 - jangan biarkan server mati
+        print(f"[server] RAG chat ingest program GAGAL (diabaikan): {exc}")
+
+
 def _wait_rag() -> None:
     """Tunggu ingest selesai. Timeout dari RAG_WAIT_TIMEOUT (default 60s);
     gagal/tidak siap = 503 dengan pesan jelas (bukan 500 generik)."""
@@ -195,6 +210,9 @@ def _config(thread_id: str):
 # /api/stop/{thread_id}, dicek di dalam loop streaming LLM (llm_config).
 _CANCELLED: Dict[str, threading.Event] = {}
 
+# RAG chat: event per thread (analog _CANCELLED, tapi rute /api/rag/stop).
+_RAG_CANCELLED: Dict[str, threading.Event] = {}
+
 
 # ----------------------------------------------------------------------
 # Schemas
@@ -202,6 +220,12 @@ _CANCELLED: Dict[str, threading.Event] = {}
 class ChatRequest(BaseModel):
     thread_id: Optional[str] = None
     message: str
+
+
+class RagChatRequest(BaseModel):
+    thread_id: Optional[str] = None
+    message: str
+    context_strategy: Optional[str] = None
 
 
 # ----------------------------------------------------------------------
@@ -807,6 +831,162 @@ def download(filename: str):
         filename=path.name,
         media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     )
+
+
+# ======================================================================
+# RAG CHAT (tanya dokumen) - pola SSE chat_stream, endpoint terpisah agar
+# pipeline modul /api/chat* tidak tersentuh.
+# ======================================================================
+
+# Status manusiawi per tahap RAG chat (dikirim apa adanya; UI merotasi
+# varian sendiri per stage lewat STAGE_VARIANTS di index.html).
+RAG_STATUS_LABELS = {
+    "rag.rewrite": "Merapikan pertanyaan agar pencarian akurat…",
+    "rag.retrieve": "Mencari referensi dokumen paling relevan…",
+}
+
+
+@app.post("/api/rag/docs/upload")
+async def rag_upload(file: UploadFile = File(...)):
+    """Upload dokumen (PDF/DOCX) -> chunk -> embed ke rag_chat collection."""
+    name = file.filename or ""
+    lower = name.lower()
+    ext = ".pdf" if lower.endswith(".pdf") else (".docx" if lower.endswith(".docx") else "")
+    if not ext:
+        raise HTTPException(400, "Hanya file .pdf dan .docx yang didukung.")
+    content = await file.read()
+    if not content:
+        raise HTTPException(400, "File kosong.")
+
+    rag_dir = _UPLOADS_DIR / "rag_chat"
+    rag_dir.mkdir(parents=True, exist_ok=True)
+    safe = re.sub(r"[^\w\-. ]+", "_", name).strip() or f"dokumen{ext}"
+    dest = rag_dir / f"{uuid.uuid4().hex[:8]}_{safe}"
+    dest.write_bytes(content)
+
+    try:
+        from rag.chunker import load_document
+
+        load_document(dest)  # validasi bisa diurai (PDF/DOCX)
+    except Exception as exc:  # noqa: BLE001 - file rusak: buang & tolak
+        dest.unlink(missing_ok=True)
+        raise HTTPException(400, f"File tidak valid: {exc}")
+
+    from rag.chunker import doc_id_for_bytes
+    from rag.document_manager import ingest
+
+    doc_id = doc_id_for_bytes(content)
+    rec = ingest(doc_id, "upload", dest, name)
+    if rec.get("error"):
+        raise HTTPException(422, rec["error"])
+    print(f"[server] RAG dokumen di-index: {name} ({rec.get('chunk_count', 0)} chunk)")
+    return {"ok": True, **rec}
+
+
+@app.get("/api/rag/docs")
+def rag_docs():
+    """Daftar dokumen di rag_chat collection (grouped per doc_id)."""
+    from rag.document_manager import list_documents
+
+    return {"docs": list_documents()}
+
+
+@app.delete("/api/rag/docs/{doc_id}")
+def rag_delete(doc_id: str):
+    """Hapus satu dokumen (semua chunk-nya) + file di disk."""
+    from rag.document_manager import delete_document
+
+    removed = delete_document(doc_id)
+    return {"ok": True, "deleted_chunks": removed}
+
+
+@app.post("/api/rag/stop/{thread_id}")
+def rag_stop_stream(thread_id: str):
+    """Hentikan streaming jawaban RAG chat yang berjalan (idempoten)."""
+    ev = _RAG_CANCELLED.get(thread_id)
+    if ev is not None:
+        ev.set()
+    return {"ok": True, "stopped": ev is not None}
+
+
+@app.post("/api/rag/chat/stream")
+def rag_chat_stream(req: RagChatRequest):
+    """SSE tanya-jawab atas dokumen (Rewrite-Retrieve-Read + streaming).
+
+    Event (satu per baris, prefixed "data: "):
+      {"type":"thread","thread_id":"…"}
+      {"type":"status","text":"…","stage":"rag.rewrite"|"rag.retrieve"}
+      {"type":"sources","docs":[{source,page,score,source_type},…]}
+      {"type":"token","text":"…"}                 # delta jawaban
+      {"type":"final","response":{thread_id,answer,sources}}
+      {"type":"cancelled"} / {"type":"error","message":"…"}
+
+    Worker + queue (pola chat_stream): graph/LLM berjalan di thread worker
+    sehingga cancel-event terbaca; sink streaming dipasang di chat.py.
+    """
+    message = (req.message or "").strip()
+    if not message:
+        raise HTTPException(400, "Pesan kosong.")
+    thread_id = req.thread_id or str(uuid.uuid4())
+
+    cancel_ev = _RAG_CANCELLED.setdefault(thread_id, threading.Event())
+    cancel_ev.clear()
+
+    q: queue.Queue = queue.Queue()
+
+    def status_hook(text: str, stage: str):
+        q.put(("status", {"text": text, "stage": stage}))
+
+    def worker():
+        from tools.llm_config import GenerationCancelled
+        from rag.chat import run_rag_chat
+
+        set_cancel_event(cancel_ev)
+        try:
+            result = run_rag_chat(
+                thread_id,
+                message,
+                status_cb=status_hook,
+                token_cb=lambda delta: q.put(("token", delta)),
+                sources_cb=lambda docs: q.put(("sources", docs)),
+                context_strategy=req.context_strategy,
+            )
+            q.put(("final", result))
+        except GenerationCancelled:
+            q.put(("cancelled", None))
+        except Exception as exc:  # noqa: BLE001 - laporkan lewat SSE
+            q.put(("error", f"RAG chat gagal: {exc}"))
+        finally:
+            set_cancel_event(None)
+            _RAG_CANCELLED.pop(thread_id, None)
+
+    threading.Thread(target=worker, daemon=True).start()
+
+    def event_stream():
+        yield f"data: {json.dumps({'type': 'thread', 'thread_id': thread_id})}\n\n"
+        while True:
+            try:
+                kind, payload = q.get(timeout=0.25)
+            except queue.Empty:
+                yield ": keepalive\n\n"
+                continue
+            if kind == "token":
+                yield f"data: {json.dumps({'type': 'token', 'text': payload}, ensure_ascii=False)}\n\n"
+            elif kind == "status":
+                yield f"data: {json.dumps({'type': 'status', **payload}, ensure_ascii=False)}\n\n"
+            elif kind == "sources":
+                yield f"data: {json.dumps({'type': 'sources', 'docs': payload}, ensure_ascii=False)}\n\n"
+            elif kind == "final":
+                yield f"data: {json.dumps({'type': 'final', 'response': payload}, ensure_ascii=False)}\n\n"
+                break
+            elif kind == "cancelled":
+                yield f"data: {json.dumps({'type': 'cancelled'})}\n\n"
+                break
+            else:  # error
+                yield f"data: {json.dumps({'type': 'error', 'message': payload}, ensure_ascii=False)}\n\n"
+                break
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
 
 
 if __name__ == "__main__":

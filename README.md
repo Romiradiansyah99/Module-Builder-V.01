@@ -20,11 +20,29 @@ Alur dashboard:
 3. Pipeline live: fan-out paralel per modul (kartu worker), Agent 2 (writer) → Agent 3 (QA, maks 3 iterasi) → inject `.docx`.
 4. Unduh hasil di galeri akhir (folder `output/`).
 
+## Fitur Tanya Dokumen (RAG chat)
+
+Mode **Tanya Dokumen** (tombol di pojok kiri-atas dashboard) menjawab pertanyaan
+atas dokumen lewat pola *Rewrite → Retrieve → Read*: menyusun ulang pertanyaan
+(LLM), retrieve dari koleksi gabungan (dokumen Anda + program aktif + SKKNI),
+lalu menjawab dengan **sitasi sumber** `[nama file, hal. n]` secara streaming.
+
+- Unggah **PDF/DOCX** (tombol lampiran) → di-chunk → di-embed → masuk koleksi
+  `rag_chat` (Chroma), dapat dihapus per dokumen dari panel *Tanya Dokumen* di sidebar.
+- Program pelatihan aktif otomatis di-index saat server menyala.
+- Konteks berlebihan ditangani strategi **create-and-refine** atau
+  **tree-summarization** (atur `RAG_CONTEXT_STRATEGY`).
+- Endpoint baru (semua dilindungi `require_auth`, tanpa mengubah pipeline modul):
+  `POST /api/rag/chat/stream` · `POST /api/rag/stop/{id}` ·
+  `POST /api/rag/docs/upload` · `GET /api/rag/docs` · `DELETE /api/rag/docs/{id}`
+
 ## Script pendukung
 
 ```bash
 python smoke_test.py             # validasi semua komponen (ingest RAG otomatis)
 python smoke_test.py --full     # + pipeline end-to-end 1 modul dengan LLM nyata
+python -m rag.smoke             # smoke struktural RAG chat (chunker + store)
+python -m rag.smoke --embed     # + ingest/retrieve/delete nyata (embedder lokal)
 python tools/vector_store.py "query"       # tes RAG retrieve manual
 python tools/vector_store.py "query" --force  # rebuild index dari nol
 python tools/word_injector.py    # demo render template (tanpa LLM)
@@ -39,6 +57,13 @@ Semua endpoint diatur di `.env` (salin dari `.env.example`) — provider bisa be
 - `PROGRAM_DOC_PATH` — dokumen program pelatihan (konteks Agent 1).
 - `EXAMPLE_MODULES_DIR` — folder contoh modul (acuan gaya Agent 2).
 - `TEMPLATE_PATH` — template `.docx` dengan tag `{{ placeholder }}`.
+
+RAG chat (`rag/`) — blok `# --- RAG CHAT ---` di `.env.example`:
+- `RAG_CHAT_COLLECTION` (koleksi Chroma), `RAG_TOP_K_CHAT` (jumlah dokumen).
+- `RAG_CONTEXT_STRATEGY` (`create-and-refine` / `tree-summarization`) & `RAG_CONTEXT_MAX_CHARS`.
+- `RAG_HISTORY_MAX_TURNS` / `RAG_HISTORY_MAX_CHARS` — klip riwayat percakapan.
+- `RAG_ANSWER_TEMPERATURE` / `RAG_ANSWER_MAX_TOKENS` / `RAG_REFINE_MAX_TOKENS`.
+- `RAG_PROGRAM_DOC_PATH` — program docx yang otomatis di-index untuk RAG chat.
 
 ## Struktur
 
@@ -58,6 +83,16 @@ Semua endpoint diatur di `.env` (salin dari `.env.example`) — provider bisa be
 │   ├── doc_utils.py        # Ekstraksi teks docx + penemuan tag template
 │   ├── template_builder.py # Bangun ulang template docx dengan tag {{ placeholder }}
 │   └── word_injector.py    # docxtpl: draft_json → file .docx
+├── rag/                    # RAG chat (tanya dokumen) — Rewrite-Retrieve-Read
+│   ├── chat.py             # Orkestrator jawaban streaming (dipakai server.py)
+│   ├── retriever.py        # Retrieve gabungan (rag_chat + skkni_kemnaker)
+│   ├── rewriter.py         # Tulis-ulang pertanyaan (LLM)
+│   ├── context.py          # create-and-refine / tree-summarization (overflow)
+│   ├── document_manager.py # upload/list/delete + ingest program
+│   ├── chunker.py          # Muat PDF/DOCX + potong chunk stabil
+│   ├── store.py            # Abstraksi VectorStore (Chroma) — Qdrant nanti
+│   ├── threads.py          # Riwayat percakapan RAG (in-memory)
+│   └── smoke.py            # Smoke struktural + ingest/retrieve/delete
 └── database/
     ├── skkni_docs/         # PDF SKKNI (sumber RAG)
     ├── chroma_db/          # Index vector persist
