@@ -550,25 +550,37 @@ def agent2_node(module: ModuleState) -> dict:
             if not str(draft_json.get("cover_image_query") or "").strip():
                 draft_json["cover_image_query"] = module["module_title"]
             iq = draft_json.get("image_queries")
-            if not isinstance(iq, list) or not iq:
-                seen_elem: set = set()
-                iq_fb = []
-                for r in draft_json.get("elemen_rows") or []:
-                    if not isinstance(r, dict):
-                        continue
-                    no = str(r.get("elemen_no", "")).strip().rstrip(".")
-                    if not no or no in seen_elem:
-                        continue
-                    seen_elem.add(no)
-                    elemen_txt = re.sub(r"^\d+\.\s*", "", str(r.get("elemen") or "")).strip()
-                    iq_fb.append({
+            # Ronde 16 ketersediaan: JAMININ setiap subbab elemen punya entri
+            # image_queries - gabungkan entri yang DIBERIKAN LLM dengan fallback
+            # utk subbab yang masih kosong (sebelumnya fallback hanya jika
+            # image_queries kosong total; bila LLM mengisi sebagian, sisanya
+            # kosong dan subbab itu kehilangan gambar).
+            llm_map: dict = {}
+            if isinstance(iq, list):
+                for e in iq:
+                    if isinstance(e, dict) and str(e.get("subbab") or "").strip():
+                        llm_map[str(e.get("subbab")).strip().rstrip(".")] = e
+            seen_elem: set = set()
+            iq_merged = []
+            for r in draft_json.get("elemen_rows") or []:
+                if not isinstance(r, dict):
+                    continue
+                no = str(r.get("elemen_no", "")).strip().rstrip(".")
+                if not no or no in seen_elem:
+                    continue
+                seen_elem.add(no)
+                if no in llm_map:
+                    iq_merged.append(llm_map[no])
+                else:
+                    elemen_txt = re.sub(
+                        r"^\d+\.\s*", "", str(r.get("elemen") or "")).strip()
+                    iq_merged.append({
                         "subbab": no,
                         "query": f"{module['module_title']} {elemen_txt}".strip(),
                         "judul": elemen_txt or module["module_title"],
                     })
-                if iq_fb:
-                    print("[agent2] image_queries kosong dari LLM - fallback dari elemen_rows")
-                    draft_json["image_queries"] = iq_fb
+            if iq_merged:
+                draft_json["image_queries"] = iq_merged
             break
         except ValueError as exc:
             last_err = exc

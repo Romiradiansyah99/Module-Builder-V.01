@@ -6,9 +6,9 @@ pake API replicate ku" - jadi Agent 2 boleh memilih mode "generate" pada
 image_queries/cover (ilustrasi proses/abstrak yang memang tidak ada
 fotonya), dan tools ini mengeksekusinya.
 
-Model: black-forest-labs/flux-schnell (official - endpoint /v1/models/
-<owner>/<name>/predictions tanpa perlu version hash), cepat ±2-5s,
-murah (~$0.003/gambar).
+Model: google/nano-banana-v2 (Gemini 2.5 Flash Image - "Nano Banana 2") via
+Replicate (/v1/models/<owner>/<name>/predictions). Lebih lambat & lebih mahal
+dari flux-schnell (±15-60s) tapi kualitas generatif jauh lebih tinggi.
 
 Token dari env REPLICATE_API_TOKEN (jangan pernah dicetak/log). Semua
 kegagalan aman: return None - pemanggil (word_injector) jatuh ke pencari
@@ -27,8 +27,8 @@ _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(_PROJECT_ROOT / ".env")
 
 _API_BASE = "https://api.replicate.com/v1"
-_MODEL = "black-forest-labs/flux-schnell"
-_POLL_TIMEOUT_S = 120
+_MODEL = "google/nano-banana-v2"
+_POLL_TIMEOUT_S = 180
 
 # Ronde 15 (keluhan user: "generate gambar ny kenapa jelek"): prompt polos
 # pada flux-schnell menghasilkan foto-palsu berkualitas rendah. Teruji
@@ -54,6 +54,15 @@ def _styled_prompt(prompt: str) -> str:
     return q + _STYLE_SUFFIX
 
 
+# Nano Banana (Gemini 2.5 Flash Image) memakai kolom `size` (piksel "WxH"),
+# BUKAN `aspect_ratio` seperti flux-schnell. 1152x864 = 4:3 landscape.
+_INPUT_SIZE = "1152x864"
+
+
+def _input(prompt: str):
+    return {"prompt": _styled_prompt(prompt), "size": _INPUT_SIZE}
+
+
 def _token() -> str:
     return os.getenv("REPLICATE_API_TOKEN", "").strip()
 
@@ -73,7 +82,7 @@ def generate_image(prompt: str, out_path: Path) -> Optional[Path]:
         r = httpx.post(
             f"{_API_BASE}/models/{_MODEL}/predictions",
             headers=headers,
-            json={"input": {"prompt": _styled_prompt(prompt), "aspect_ratio": "4:3"}},
+            json={"input": _input(prompt)},
             timeout=30,
         )
         if r.status_code != 201:
@@ -95,8 +104,7 @@ def generate_image(prompt: str, out_path: Path) -> Optional[Path]:
                     r2 = httpx.post(
                         f"{_API_BASE}/models/{_MODEL}/predictions",
                         headers=headers,
-                        json={"input": {"prompt": _styled_prompt(prompt), "aspect_ratio": "4:3"}},
-                        timeout=30,
+                        json={"input": _input(prompt)}, timeout=30,
                     )
                     if r2.status_code == 201:
                         pred = r2.json()

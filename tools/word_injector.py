@@ -87,6 +87,13 @@ def _slugify(text: str) -> str:
     return text.strip("_")[:60] or "modul"
 
 
+def _strip_heading(heading: str) -> str:
+    """Hapus nomor di awal judul subbab: "1. Merakit Panel Surya" ->
+    "Merakit Panel Surya". Dipakai ronde 16 untuk judul caption & fallback
+    query gambar bila Agent 2 tidak menyediakan entri foto utk subbab itu."""
+    return re.sub(r"^\d+(\.\d+)*\.?\s+", "", heading or "").strip()
+
+
 def _render_mermaid_safe(code: str, out_path: Path) -> Optional[Path]:
     """Render skrip mermaid -> PNG; None kalau gagal (jangan pernah crash
     injection karena skrip mermaid yang tidak sempurna)."""
@@ -129,7 +136,7 @@ _COVER_Y_MM = 72.0  # jarak dari atas kertas: judul berakhir ~47mm, footer 268mm
 
 def _fetch_image_safe(query: str, out_path: Path, mode: str = "cari") -> Optional[Path]:
     """Gambar utk query dengan mode pilihan Agent 2 (ronde 13b):
-    - "generate": AI Replicate (flux-schnell) dulu -> gagal: cari internet.
+    - "generate": AI Replicate (google/nano-banana-v2) dulu -> gagal: cari internet.
     - "cari"    : foto nyata internet dulu -> gagal: fallback AI Replicate
       (agar tiap subbab/cover dijamin punya gambar; Replicate dijalankan
       hanya bila pencarian kosong).
@@ -298,32 +305,50 @@ def _build_pengetahuan_subdoc(tpl: DocxTemplate, text: str, tmp_dir: Path,
         cap_run.font.name = "Bookman Old Style"
         cap_run.font.size = Pt(11)
 
+    def _add_picture_centered(png, max_box, caption=None) -> bool:
+        """Gambar pada PARAGRAF SENDIRI, rata-tengah (ronde 16: posisi & lebar
+        konsisten, bukan inline di paragraf heading yang rata-kiri), dengan
+        caption "Gambar N." opsional. Return True bila gambar berhasil
+        dipasang; pemanggil mengelola counter `img_i`."""
+        from docx.enum.text import WD_ALIGN_PARAGRAPH
+
+        width_mm = _fit_png(png, *max_box)
+        if not width_mm:
+            return False
+        p = sub.add_paragraph()
+        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        p.add_run().add_picture(str(png), width=Mm(width_mm))
+        if caption:
+            _add_caption(caption)
+        return True
+
     def _maybe_photo(heading: str) -> None:
-        """Foto relevan tepat di bawah judul subbab (komentar reviewer ronde
-        13: "masih ga ada gambar" - diagram saja tidak cukup). Counter
-        "Gambar N." hanya naik saat foto BENAR-BENAR terpasang - kalau tidak,
-        caption mermaid mulai dari "Gambar 2." tanpa "Gambar 1." (bug terukur
-        pada smoke ronde 13)."""
+        """Foto/ilustrasi ter-center tepat di bawah judul subbab (komentar
+        reviewer ronde 13: "masih ga ada gambar" - diagram saja tidak cukup;
+        ronde 16: tiap subbab DIJAMIN punya gambar, rata-tengah, ukuran
+        konsisten). Counter "Gambar N." hanya naik saat foto BENAR-BENAR
+        terpasang - kalau tidak, caption mermaid mulai dari "Gambar 2." tanpa
+        "Gambar 1." (bug terukur pada smoke ronde 13)."""
         nonlocal img_i
-        if not photo_queries or not heading:
-            return
-        m = re.match(r"^(\d+)\.\s", heading)
+        m = re.match(r"^(\d+)\.\s", heading or "")
         if not m:
             return
-        spec = photo_queries.get(m.group(1))
-        if not spec:
+        subbab_no = m.group(1)
+        spec = (photo_queries or {}).get(subbab_no)
+        # Ronde 16 ketersediaan: subbab tanpa entri query tetap wajib punya
+        # gambar -> fallback query dari judul subbab itu sendiri.
+        query = (spec or {}).get("query") or _strip_heading(heading)
+        if not query:
             return
         png = _fetch_image_safe(
-            spec.get("query"), tmp_dir / f"foto_{m.group(1)}.png",
-            mode=str(spec.get("mode") or "cari"),
+            query, tmp_dir / f"foto_{subbab_no}.png",
+            mode=str((spec or {}).get("mode") or "cari"),
         )
         if png is not None:
-            width_mm = _fit_png(png, *_IMG_PENGETAHUAN_MAX)
-            if width_mm:
-                img_i += 1
-                sub.add_picture(str(png), width=Mm(width_mm))
-                _add_caption(str(spec.get("judul") or spec.get("query") or
-                                 "Gambar kerja"))
+            img_i += 1
+            judul = ((spec or {}).get("judul") or (spec or {}).get("query")
+                     or _strip_heading(heading) or "Gambar kerja")
+            _add_picture_centered(png, _IMG_PENGETAHUAN_MAX, judul)
 
     def _add_lines(chunk: str) -> None:
         nonlocal last_heading
@@ -339,19 +364,21 @@ def _build_pengetahuan_subdoc(tpl: DocxTemplate, text: str, tmp_dir: Path,
         # teks sebelum blok mermaid
         _add_lines(text[pos : m.start()])
         code = m.group(1)
-        img_i += 1
+        img_i += 1   # reserve nomor "Gambar N." walau render gagal berhasil
         png = _render_mermaid_safe(code, tmp_dir / f"mermaid_{img_i}.png")
         if png is not None:
-            width_mm = _fit_png(png, *_IMG_PENGETAHUAN_MAX)
-            if width_mm:
-                sub.add_picture(str(png), width=Mm(width_mm))
-                # Caption "Gambar N. <judul>" di bawah gambar (komentar
-                # reviewer: gambar/flowchart wajib berjudul).
-                judul = re.sub(r"^\d+(\.\d+)*\.?\s+", "", last_heading).strip() \
-                    if last_heading else "Diagram alur kerja"
+            # Ronde 16: diagram tetap di posisi inline tempat penulisan (di
+            # dalam urutan teks subbab), tetapi di-center + caption + lebar
+            # konsisten (sebelumnya rata-kiri inline di paragraf teks).
+            judul = _strip_heading(last_heading) or "Diagram alur kerja"
+            if not _add_picture_centered(png, _IMG_PENGETAHUAN_MAX, judul):
+                # PIL tak bisa membaca dimensi -> tetap center, lebar tetap.
+                from docx.enum.text import WD_ALIGN_PARAGRAPH
+
+                p = sub.add_paragraph()
+                p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                p.add_run().add_picture(str(png), width=Inches(5.7))
                 _add_caption(judul)
-            else:
-                sub.add_picture(str(png), width=Inches(5.7))
         else:
             # renderer gagal -> simpan skripnya sebagai teks agar tidak hilang
             for line in ("```mermaid" + code + "```").split("\n"):

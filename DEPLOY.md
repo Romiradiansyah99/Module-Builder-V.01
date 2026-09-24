@@ -101,6 +101,63 @@ Point DNS A record ke IP VPS → `docker compose up -d` → Let's Encrypt
 otomatis. Lalu set `COOKIE_SECURE=1` di `.env` dan `docker compose up -d`
 lagi. (Tanpa domain: pakai HTTP `8000:8000` — cukup untuk tim internal.)
 
+### 5b. Tanpa domain — Cloudflare Tunnel `trycloudflare` (gratis)
+
+Tidak perlu Caddy maupun DNS. App tetap bind `127.0.0.1:8000` (kompose sudah
+begitu); hanya tunnel yang menyentuhnya. HTTPS diurus Cloudflare.
+
+```bash
+# Install tunnel sekali:
+curl -L https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o /usr/local/bin/cloudflared
+chmod +x /usr/local/bin/cloudflared
+
+# Jalankan quick tunnel (URL acak, hidup selama proses ini jalan):
+cloudflared tunnel --url http://localhost:8000
+# -> baca https://<random>.trycloudflare.com dari output, buka di browser.
+```
+
+Catatan:
+- URL acak berubah tiap kali `cloudflared` dijalankan ulang. Untuk URL tetap
+  dibutuhkan **named tunnel** + domain (lihat §5).
+- `COOKIE_SECURE` biarkan `0` (tunnel trycloudflare HTTP di sisi Cloudflare,
+  cookie tetap lewat HTTPS publik — cukup; set `1` bila pakai domain §5).
+- Wajib pasang `APP_PASSWORD_SHA256` + `SESSION_SECRET` sebelum diekspos:
+  tanpa itu siapa pun bisa login & memicu pipeline LLM berbayar.
+- Rotasi `LLM_API_KEY` dulu — key lama pernah plaintext di repo lokal.
+
+### 5c. Jalankan tunnel sebagai systemd agar tahan restart (disarankan)
+
+Menjalankan `cloudflared tunnel` manual di SSH akan mati begitu sesi SSH
+ditutup (bahkan dengan `nohup`). Untuk quick tunnel yang bertahan, gunakan
+**systemd service** (di VPS yang PID1-nya systemd):
+
+```bash
+cat > /etc/systemd/system/kemnaker-tunnel.service <<'UNIT'
+[Unit]
+Description=Cloudflare tunnel -> Kemnaker app (port 8010)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/cloudflared tunnel --url http://127.0.0.1:8010 --no-autoupdate
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+systemctl daemon-reload
+systemctl enable --now kemnaker-tunnel
+systemctl is-active kemnaker-tunnel          # -> active
+# Ambil URL acak dari log:
+journalctl -u kemnaker-tunnel --no-pager | grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' | tail -1
+```
+
+Sesuaikan `--url` ke port host tempat app terbuka (mis. `http://127.0.0.1:8010`
+bila `docker-compose.yml` memetakan `8010:8000`). Restart app tidak mematikan
+tunnel service — keduanya independen.
+
 ## 6. Operasional harian
 
 | Tugas | Perintah |

@@ -75,9 +75,15 @@ from rag.threads import THREADS as RAG_THREADS
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     """Ingest RAG SKKNI sekali di thread belakang saat server menyala."""
-    threading.Thread(target=_ingest_background, daemon=True).start()
-    # RAG chat: auto-index program docx aktif (best-effort, tidak memblokir).
-    threading.Thread(target=_ingest_rag_background, daemon=True).start()
+    skkni_thread = threading.Thread(target=_ingest_background, daemon=True)
+    skkni_thread.start()
+    # RAG chat: auto-index program docx aktif - jalankan SETELAH thread SKKNI
+    # selesai agar tidak ada dua inisialisasi pertama PersistentClient chromadb
+    # yang konkuren (chromadb 1.5.9 race 'RustBindingsAPI' saat boot menyebabkan
+    # _rag_error terset -> _wait_rag() mem-503 semua /api/chat).
+    threading.Thread(
+        target=_ingest_rag_background, args=(skkni_thread,), daemon=True
+    ).start()
     yield
 
 
@@ -128,6 +134,15 @@ _UPLOADS_DIR = _resolve_env_path("UPLOADS_DIR", _PROJECT_ROOT / "database" / "up
 # Batas produksi paralel (proteksi belanja LLM cloud saat dipakai tim).
 _PRODUCE_SEMAPHORE = threading.Semaphore(max(1, int(os.getenv("PRODUCE_CONCURRENCY", "2"))))
 
+# Header untuk respon SSE streaming - mencegah proxy/tunnel (mis. Cloudflare
+# quick tunnel, nginx) menahan-buffer aliran sehingga browser tidak melihat
+# "network error" palsu saat koneksi SSE berumur panjang diputus sesaat.
+_SSE_HEADERS = {
+    "Cache-Control": "no-cache",
+    "X-Accel-Buffering": "no",  # nonaktifkan buffering di nginx/proxy upstream
+    "Connection": "keep-alive",
+}
+
 # ----------------------------------------------------------------------
 # Resource global (satu graph + satu ingest RAG untuk semua session demo)
 # ----------------------------------------------------------------------
@@ -177,8 +192,16 @@ def _ingest_background():
         print(f"[server] RAG ingest GAGAL: {exc}")
 
 
-def _ingest_rag_background():
-    """Auto-index program docx aktif utk RAG chat (best-effort)."""
+def _ingest_rag_background(prior_thread=None):
+    """Auto-index program docx aktif utk RAG chat (best-effort).
+
+    `prior_thread` = thread ingest SKKNI. Ditunggu selesai dulu supaya tidak
+    ada dua inisialisasi `PersistentClient` chromadb yang konkuren (chromadb
+    1.5.9 race 'RustBindingsAPI') - tanpa ini thread SKKNI bisa crash saat
+    boot dan `_wait_rag()` mem-503 semua endpoint module-builder chat.
+    """
+    if prior_thread is not None:
+        prior_thread.join(timeout=120)
     try:
         from rag.document_manager import ingest_program
 
@@ -315,6 +338,12 @@ def _prepare_chat(req: ChatRequest) -> Tuple[str, list, bool, dict]:
         _touch(SESSIONS[thread_id], new=True)
         seed = list(SESSIONS[thread_id]["chat_messages"])
         continuing = False  # thread baru -> full init
+        # Ronde 16: thread baru T2 adalah revisi. Thread lama (session) tidak
+        # boleh lagi di-approve/diproduksi (draf basi) -> phase "chat" membuat
+        # /api/approve/T1 membalas 409, sehingga hanya draf TERBARU di T2 yang
+        # bisa disetujui.
+        session["phase"] = "chat"
+        _touch(session)
     elif old_thread:
         thread_id = old_thread
         session["chat_messages"].append({"role": "user", "content": message})
@@ -605,7 +634,7 @@ def chat_stream(req: ChatRequest):
                 yield f"data: {json.dumps({'type': 'error', 'message': payload}, ensure_ascii=False)}\n\n"
                 break
 
-    return StreamingResponse(event_stream(), media_type="text/event-stream")
+    return StreamingResponse(event_stream(), media_type="text/event-stream", headers=_SSE_HEADERS)
 
 
 @app.post("/api/stop/{thread_id}")
@@ -749,7 +778,7 @@ def approve(thread_id: str):
                 yield f"data: {json.dumps({'type': 'error', 'message': payload}, ensure_ascii=False)}\n\n"
                 break
 
-    return StreamingResponse(event_stream(), media_type="text/event-stream")
+    return StreamingResponse(event_stream(), media_type="text/event-stream", headers=_SSE_HEADERS)
 
 
 def _slim(module) -> dict:
@@ -986,7 +1015,7 @@ def rag_chat_stream(req: RagChatRequest):
                 yield f"data: {json.dumps({'type': 'error', 'message': payload}, ensure_ascii=False)}\n\n"
                 break
 
-    return StreamingResponse(event_stream(), media_type="text/event-stream")
+    return StreamingResponse(event_stream(), media_type="text/event-stream", headers=_SSE_HEADERS)
 
 
 if __name__ == "__main__":
