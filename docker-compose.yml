@@ -28,8 +28,9 @@ services:
       # embedder lokal ONNX yang COCOK dengan index chroma_db shipped.
       # Mengisi kandidat remote = RAG terdegradasi senyap.
     ports:
-      # Hanya localhost: HTTPS di belakang Caddy (service caddy di bawah).
-      # Tanpa HTTPS/Caddy: ganti menjadi "8000:8000".
-      - "127.0.0.1:8000:8000"
+      # Hanya localhost. Tunnel systemd (kemnaker-tunnel) meneruskan
+      # https://...trycloudflare.com -> 127.0.0.1:8010. Bind host 8010 ke
+      # kontainer 8000 (port 8000 global dipakai container lain di VPS ini).
+      - "127.0.0.1:8010:8000"
     volumes:
       - ./runtime:/app/runtime
