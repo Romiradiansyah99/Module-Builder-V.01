@@ -467,12 +467,24 @@ def parse_modules_json(text: str) -> tuple:
     return data["program_name"], modules
 
 
+# Kolom isi silabus yang boleh diisi dari LLM bila sel docx KOSONG. Nilai docx
+# yang sudah terisi SELALU menang (tidak tergantikan). Key identitas
+# (elemen_no/kuk_no) tidak ikut - mereka penanda baris, bukan isi.
+_MERGE_FILL_KEYS = ("elemen", "kuk", "indikator", "pengetahuan", "keterampilan",
+                    "durasi")
+
+
 def _merge_rows(base_rows: List[dict], llm_rows: List[dict]) -> List[dict]:
-    """Ronse 5: isi sel KOSONG di rows tabel acuan docx dengan nilai dari rows
-    LLM (dicocokkan per kuk_no). Nilai docx yang sudah terisi SELALU menang -
-    LLM hanya melengkapi kekosongan (indikator/pengetahuan/keterampilan).
-    Dulu rows LLM untuk unit partial dibuang mentah-mentah -> sel kosong
-    tetap kosong walau user minta diisi (bug keluhan user)."""
+    """Ronde 5 (diperluas Ronde 17): isi sel KOSONG di rows tabel acuan docx
+    dengan nilai dari rows LLM. Dua jaminan:
+      1. TERISI - SEMUA kolom isi (elemen, kuk, indikator, pengetahuan,
+         keterampilan, durasi) yang kosong diisi dari LLM; sebelumnya hanya 3
+         kolom konten, sehingga elemen/kuk/durasi bisa tertinggal kosong.
+      2. TIDAK TERGANTIKAN - nilai docx yang sudah terisi SELALU menang; LLM
+         hanya melengkapi sel yang benar-benar kosong.
+    Pemetaan utama per kuk_no; bila kuk_no tidak cocok, fallback posisional
+    (baris LLM ke-i untuk baris docx ke-i) agar partial unit tetap terisi.
+    Key identitas (elemen_no/kuk_no) tidak pernah diganti."""
     if not llm_rows:
         return base_rows
     by_kuk = {}
@@ -481,11 +493,13 @@ def _merge_rows(base_rows: List[dict], llm_rows: List[dict]) -> List[dict]:
         if key and key not in by_kuk:
             by_kuk[key] = r
     out = []
-    for r in base_rows:
+    for i, r in enumerate(base_rows):
         r = dict(r)
         src = by_kuk.get(str(r.get("kuk_no", "")).strip())
-        if src:
-            for k in ("indikator", "pengetahuan", "keterampilan"):
+        if src is None and i < len(llm_rows):
+            src = llm_rows[i]  # fallback posisional utk kuk_no yang tak cocok
+        if isinstance(src, dict):
+            for k in _MERGE_FILL_KEYS:
                 if not str(r.get(k, "") or "").strip() and str(src.get(k, "") or "").strip():
                     r[k] = src[k]
         out.append(r)

@@ -198,11 +198,22 @@ def to_active_voice(text: str, indikator: str = "") -> str:
     Contoh nyata: indikator "Teridentifikasinya dasar, tujuan, perintah
     kerja, perlengkapan K2..." -> keterampilan "Mengidentifikasi maksud dan
     tujuan pengoperasian Kondenser...".
+
+    Ronde 17: bila sel KETERAMPILAN kosong/tak berawal huruf (placeholder
+    seperti "." atau spasi) tetapi indikator memuat verba pasif, ISI dengan
+    pasangan AKTIF-nya (kandidat pertama) - jangan biarkan sel kosong
+    padahal indikator punya verba yang bisa diaktifkan. Bila indikator tanpa
+    verba pasif, kembalikan apa adanya (tidak mengarang).
     """
     text = (text or "").strip()
+    candidates = _expected_actives(indikator)
+    # Ronde 17: sel Keterampilan kosong/tak berawal huruf (placeholder "." dsb.)
+    # tetapi indikator punya verba pasif -> isi pasangan AKTIF-nya.
+    if not re.match(r"[A-Za-z]", text) and candidates:
+        return cap_first(candidates[0])
     if not text:
         return text
-    return _align_verb(text, _expected_actives(indikator))
+    return _align_verb(text, candidates)
 
 
 # Modal yang dibuang dari depan kalimat keterampilan (gaya Kemnaker: langsung

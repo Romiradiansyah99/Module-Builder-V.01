@@ -45,6 +45,7 @@ from tools.doc_utils import (
     cap_first,
     get_template_tags,
     pengetahuan_items,
+    to_active_voice,
 )
 from tools.mermaid_render import render_mermaid
 
@@ -437,16 +438,29 @@ def _subdoc_add_line(sub, line: str, last_heading: str = "",
 
 
 def _normalize_rows(key: str, value) -> list:
-    """Pastikan row-loop selalu list of dict dengan key lengkap."""
+    """Pastikan row-loop selalu list of dict dengan key lengkap.
+
+    Ronde 17: untuk tabel elemen (berisi kolom Indikator + Keterampilan &
+    Sikap), terapkan `to_active_voice` secara deterministik pd TITIK INJEKSI —
+    jaminan dokumen FINAL: sel keterampilan selalu berawal verba aktif pasangan
+    indikator (atau terisi dari pasangan indikator bila sel kosong/placeholder),
+    apa pun jalur upstream (LLM, fallback, docx-backed). Idempoten terhadap
+    transformasi Agent 1/2."""
     if not isinstance(value, list):
         return []
     required = _ROW_REQUIRED.get(key, ())
+    apply_verbs = key == "elemen_rows"
     rows = []
     for row in value:
         if isinstance(row, dict):
             clean = {k: ("" if v is None else str(v)) for k, v in row.items()}
             for k in required:
                 clean.setdefault(k, "")
+            if apply_verbs:
+                clean["keterampilan"] = to_active_voice(
+                    clean.get("keterampilan", ""),
+                    clean.get("indikator", ""),
+                )
             rows.append(clean)
     return rows
 
@@ -534,26 +548,12 @@ def inject_module(module: ModuleState, output_dir: Path = None) -> Path:
 
     tpl.render(context)
 
-    # Ronde 13: foto cover page - diambil dari internet, relevan dengan
-    # judul modul (query ditulis Agent 2; fallback = judul modul).
-    # Ronde 13b: cover_image_query boleh STRING atau {"query","mode"}.
-    try:
-        cv = draft_json.get("cover_image_query")
-        if isinstance(cv, dict):
-            cover_query = str(cv.get("query") or module.get("module_title") or "").strip()
-            cover_mode = str(cv.get("mode") or "cari").strip() or "cari"
-        else:
-            cover_query = str(cv or module.get("module_title") or "").strip()
-            cover_mode = "cari"
-        cover_png = _fetch_image_safe(cover_query, tmp_dir / "cover.png",
-                                      mode=cover_mode)
-        if cover_png is not None:
-            # PENTING: tpl.docx (bukan get_docx()) - get_docx() me-reload
-            # dokumen dari template mentah saat is_rendered=True (seluruh
-            # hasil render hilang, docx final berisi tag {{ }} tak terisi).
-            _add_cover_image(tpl.docx, cover_png)
-    except Exception as exc:  # noqa: BLE001 - cover polos tetap jalan
-        print(f"[word_injector] Foto cover gagal ({exc}) - lewati")
+    # Ronde 17 (reviewer): GAMBAR COVER TIDAK diganti - pakai GAMBAR ASLI dari
+    # template "word Kemenaker lama" (tertanam di section cover sebagai anchor
+    # di belakang textbox judul). Sblmnya foto internet (cover_image_query) di-
+    # fetch lalu di-overlay di atasnya, menutupi gambar template; kini biarkan
+    # gambar cover template tampil apa adanya. (cover_image_query di draft tidak
+    # lagi dipakai; query gambar tetap berfungsi utk SUBBAB via image_queries.)
 
     # --- Simpan hasil (atomik) ---
     filename = f'{module.get("module_id", "M?")}_{_slugify(module.get("module_title", "modul"))}.docx'
