@@ -193,7 +193,16 @@ def t_graph():
     from main_graph import build_graph
 
     graph = build_graph()
-    print(graph.get_graph().draw_ascii())
+    # draw_ascii() butuh paket opsional `grandalf`, yang sengaja TIDAK ada di
+    # image Docker (tak dipakai saat runtime). Cetakannya cuma keterangan;
+    # yang dinilai adalah build_graph() berhasil dikompilasi. Sebelum ini
+    # langkah 8 GAGAL di VPS hanya karena paket opsional itu absen, sehingga
+    # gerbang rilis terbaca merah padahal topologinya sehat.
+    try:
+        print(graph.get_graph().draw_ascii())
+    except Exception as exc:  # noqa: BLE001 - keterangan opsional
+        print(f"  (gambar ASCII graph dilewati: {type(exc).__name__} - "
+              f"`pip install grandalf` bila ingin melihatnya)")
     snap = graph  # compile sukses = topologi valid
     assert snap is not None
 
@@ -460,6 +469,17 @@ def t_gates_and_normalize():
         _srv.SESSIONS["smoke-t"] = {"phase": "approval", "thread_id": "smoke-t"}
         _srv.get_graph = lambda: _FakeGraph()
         _cli = TestClient(_srv.app, raise_server_exceptions=False)
+        # Di deployment (VPS), auth AKTIF dan middleware app-level menolak
+        # /api/* dengan 401 SEBELUM handler validasi sempat jalan - sehingga
+        # langkah ini gagal 401 di sana walau logikanya benar (lokal lolos
+        # karena .env dev tanpa APP_PASSWORD_SHA256). Langkah ini menguji
+        # VALIDASI penyusun, bukan auth, jadi pakai cookie sesi yang sah
+        # (ditandatangani SESSION_SECRET yang sama) supaya hasilnya sama di
+        # kedua lingkungan.
+        from tools.auth import auth_configured, make_session_token
+
+        if auth_configured():
+            _cli.cookies.set("kb_session", make_session_token())
         assert _cli.post("/api/approve/smoke-t",
                          json={"nama": "", "profesi": ""}).status_code == 400
         assert _cli.post("/api/approve/smoke-t",
