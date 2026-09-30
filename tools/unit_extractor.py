@@ -15,6 +15,7 @@ Output utama:
 - get_units_block()            -> blok teks untuk prompt Agent 1
 - format_units_markdown()      -> daftar markdown untuk balasan chat
 - match_unit(units, title)     -> snap judul LLM ke judul unit kanonik
+- rank_units(units, text)      -> peringkat unit dari KALIMAT BEBAS user (judul, bukan cuma nomor)
 
 Toleransi data (terverifikasi pada file program aktual):
 - Header daftar unit punya 2 baris (row 0 merged stub, row 1 header asli).
@@ -260,6 +261,51 @@ def format_units_markdown(units=None) -> str:
     for u in units:
         lines.append(f"| {u['no']} | {u['judul']} | {u['kode'] or '-'} | {u['jumlah'] or '-'} JP |")
     return "\n".join(lines)
+
+
+def _norm_free_text(s: str) -> str:
+    """Normalisasi kalimat bebas: huruf kecil, tanda baca -> spasi, spasi rapat."""
+    s = re.sub(r"[^\w\s]", " ", (s or "").lower())
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def rank_units(units, text: str, cutoff: float = 0.55, limit: int = 5) -> List[tuple]:
+    """Peringkat unit paling cocok dengan KALIMAT BEBAS user.
+
+    Dipakai agar user boleh menyebut JUDUL unit, bukan hanya nomornya
+    ("jangan kaku ke angka aja"). Return [(unit, skor)] menurun, hanya >= cutoff.
+
+    Skor sengaja asimetris pada kasus substring:
+    - judul utuh MUNCUL di kalimat user (mis. chip UI "Buatkan modul untuk unit
+      <judul>") -> sinyal kuat, 0.95;
+    - user hanya mengetik POTONGAN judul -> 0.9 x rasio panjang, sehingga
+      potongan pendek tidak menang atas judul panjang yang benar.
+    """
+    t_raw = (text or "").strip()
+    t = _norm_free_text(t_raw)
+    if not t:
+        return []
+
+    scored = []
+    for u in units:
+        judul = (u.get("judul") or "").strip()
+        j = _norm_free_text(judul)
+        if not j:
+            continue
+        if judul == t_raw:
+            score = 1.0
+        elif j == t:
+            score = 0.99
+        elif j in t:
+            score = 0.95
+        elif t in j:
+            score = 0.9 * (len(t) / len(j))
+        else:
+            score = difflib.SequenceMatcher(None, j, t).ratio()
+        scored.append((u, score))
+
+    scored.sort(key=lambda pair: (-pair[1], pair[0].get("no") or ""))
+    return [(u, s) for u, s in scored if s >= cutoff][:limit]
 
 
 def match_unit(units, title: str) -> Optional[dict]:

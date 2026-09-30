@@ -225,7 +225,18 @@ table.md tbody tr:last-child td{border-bottom:1px solid var(--hairline)}
 .ac-detail{display:none; padding:0 15px 15px; border-top:1px solid var(--hairline)}
 .ac-detail.show{display:block}
 .ac-detail .hint{color:var(--muted); font-size:11.5px; margin:10px 0 4px}
-.ac-actions{display:flex; gap:8px; flex-wrap:wrap; align-items:center}
+/* Ronde 18: gerbang NAMA PENYUSUN di kartu approval */
+.ac-penyusun{border-top:1px solid var(--hairline); padding:12px 15px 4px}
+.ac-penyusun .hint{color:var(--muted); font-size:11.5px; margin:0 0 8px}
+.py-grid{display:flex; gap:8px; flex-wrap:wrap; margin-bottom:8px}
+.py-grid input{
+  flex:1; min-width:150px; background:var(--surface); color:var(--text); border:1px solid var(--input-border);
+  border-radius:999px; padding:9px 15px; font-size:13px; outline:none;
+  transition:border-color .15s, box-shadow .15s;
+}
+.py-grid input:focus{border-color:var(--accent); box-shadow:var(--ring)}
+.py-err{color:#c0392b; font-size:12px; margin:2px 0 8px}
+.ac-actions{display:flex; gap:8px; flex-wrap:wrap; align-items:center; padding:0 15px 15px}
 .ac-actions input{
   flex:1; min-width:180px; background:var(--surface); color:var(--text); border:1px solid var(--input-border);
   border-radius:999px; padding:10px 16px; font-size:13.5px; outline:none;
@@ -549,9 +560,28 @@ function renderApprovalCard(mods){
         </div>
       </div>`;
   }).join("");
+  // Ronde 18: NAMA PENYUSUN = GATE. Reviewer: "Harusnya diisi dulu, sblum
+  // dibuat, ini jadi gate sblum mebiatan". Draf dari percakapan dipakai untuk
+  // mengisi-awal supaya user tinggal mengonfirmasi.
+  const py = (approvalModules[0] && approvalModules[0].penyusun) || {};
+  const firstLine = s => String(s || "").split("\n")[0];
   card.innerHTML = `
     <div class="ac-head">Draft silabus siap — silakan tinjau sebelum produksi</div>
     <div class="ac-modules">${rows}</div>
+    <div class="ac-penyusun">
+      <div class="hint">Nama penyusun <b>wajib diisi</b> sebelum produksi — tercetak di halaman Daftar Nama Penyusun.</div>
+      <div class="py-grid">
+        <input id="py-nama" placeholder="Nama penyusun *" value="${esc(py.nama || "")}">
+        <input id="py-profesi" placeholder="Jabatan / profesi *" value="${esc(firstLine(py.profesi))}">
+        <input id="py-nip" placeholder="NIP (opsional)" value="${esc(py.nip || "")}">
+      </div>
+      <div class="py-grid">
+        <input id="py-nama2" placeholder="Nama penyusun kedua (opsional)" value="${esc(py.nama2 || "")}">
+        <input id="py-profesi2" placeholder="Jabatan / profesi kedua" value="${esc(firstLine(py.profesi2))}">
+        <input id="py-nip2" placeholder="NIP kedua (opsional)" value="${esc(py.nip2 || "")}">
+      </div>
+      <div id="py-err" class="py-err" hidden></div>
+    </div>
     <div class="ac-actions">
       <input id="rev-input" placeholder="Tulis revisi silabus… (mis. fokus kelompok inti saja)">
       <button class="btn" onclick="sendRevision()">Kirim revisi</button>
@@ -919,14 +949,40 @@ function renderRuns(){
   }).join("");
 }
 
+function approvePenyusun(){
+  // Baca + validasi gerbang penyusun secara lokal (server tetap memvalidasi
+  // ulang - ini hanya supaya user dapat umpan balik instan).
+  const val = id => (($(id) && $(id).value) || "").trim();
+  const body = {
+    nama: val("py-nama"), profesi: val("py-profesi"), nip: val("py-nip"),
+    nama2: val("py-nama2"), profesi2: val("py-profesi2"), nip2: val("py-nip2"),
+  };
+  const err = $("py-err");
+  const kurang = [];
+  if (!body.nama) kurang.push("Nama penyusun");
+  if (!body.profesi) kurang.push("Jabatan / profesi");
+  if (kurang.length){
+    if (err){ err.hidden = false; err.textContent = "Wajib diisi sebelum produksi: " + kurang.join(", ") + "."; }
+    return null;
+  }
+  if (err){ err.hidden = true; err.textContent = ""; }
+  return body;
+}
+
 async function approve(){
   const btn = $("btn-approve");
   const tid = threadId;
   if (!tid || !btn) return;
+  const body = approvePenyusun();
+  if (!body) return;   // gerbang penyusun belum lengkap - jangan kirim
   const title = (approvalModules[0] && approvalModules[0].module_title) || "Produksi modul";
   btn.disabled = true;
   try{
-    const resp = await fetch(`${API}/api/approve/${tid}`, { method: "POST" });
+    const resp = await fetch(`${API}/api/approve/${tid}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
     if (!resp.ok || !resp.body){
       const e = await resp.json().catch(() => ({ detail: resp.statusText }));
       const msg = e.detail || resp.statusText;
@@ -934,6 +990,11 @@ async function approve(){
          menampilkan run produksi palsu. Redupkan kartu + beri arahan retry. */
       btn.disabled = false;
       log("Approve ditolak: " + msg);
+      if (String(msg).includes("penyusun")){
+        const err = $("py-err");
+        if (err){ err.hidden = false; err.textContent = msg; }
+        return;
+      }
       if (String(msg).includes("phase")){
         document.querySelectorAll(".approval-card").forEach(c => c.classList.add("stale"));
         addMsg("bot", "Belum bisa disetujui — thread sudah tidak dalam fase *menunggu setuju*. Kirim ulang permintaan pembuatan silabus (mis. tulis nama unitnya), tunggu kartu baru muncul, lalu klik **Setujui & Produksi**.");
@@ -1119,7 +1180,8 @@ $("file-input").addEventListener("change", async (e) => {
 async function loadSuggestions(){
   try{
     const j = await (await fetch(API + "/api/units")).json();
-    const n = (j.units || []).length;
+    const units = j.units || [];
+    const n = units.length;
     const sug = $("suggest");
     const opts = n
       ? [
@@ -1131,7 +1193,12 @@ async function loadSuggestions(){
           ["Usulkan unit kompetensinya", "Ya, silakan usulkan unit kompetensinya dari program ini"],
           ["Jelaskan isi program ini", "Jelaskan singkat isi program pelatihan ini"],
         ];
-    sug.innerHTML = opts.map(([label, msg]) => `<button onclick="useSuggest(${JSON.stringify(msg).replace(/"/g,"&quot;")})">${esc(label)}</button>`).join("");
+    // Ronde 18: user tidak harus hafal nomor unit - tiap unit jadi chip yang
+    // bisa diklik dan mengirim JUDUL unitnya (Agent 1 menerima nomor ATAU judul).
+    const perUnit = units.map(u => [u.no + " · " + u.judul, "Buatkan modul untuk unit " + u.judul]);
+    sug.innerHTML = opts.concat(perUnit)
+      .map(([label, msg]) => `<button onclick="useSuggest(${JSON.stringify(msg).replace(/"/g,"&quot;")})">${esc(label)}</button>`)
+      .join("");
   } catch (err){ /* abaikan */ }
 }
 function useSuggest(msg){ $("chat-text").value = msg; $("chat-text").focus(); }

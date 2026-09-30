@@ -103,8 +103,17 @@ def _apply_heading_styles(doc) -> None:
 
 
 def _normalize_colors(doc) -> None:
-    """Semua run berwarna biru (00B0F0) -> hitam; MERAH (FF0000, catatan
-    instruksi) dipertahankan - sesuai komentar reviewer tentang seragam warna."""
+    """Semua warna biru (00B0F0) -> hitam; MERAH (FF0000, catatan instruksi)
+    dipertahankan - sesuai komentar reviewer tentang seragam warna.
+
+    Ronde 18: versi lama hanya menyapu run (`w:r`), sehingga DUA sumber biru
+    lolos dan tampil di dokumen hasil sebagai NOMOR DAFTAR berwarna biru
+    (keluhan reviewer: "Knp numbering ny warna biru, fix"):
+      1. `w:pPr/w:rPr/w:color` - format tanda paragraf; Word mewariskannya ke
+         glyph nomor/bullet saat definisi numbering tidak menentukan warna.
+      2. `w:lvl/w:rPr/w:color` di word/numbering.xml - warna level daftar.
+    Keduanya kini disapu bersih lewat XML langsung.
+    """
     from docx.shared import RGBColor
 
     def fix_runs(runs):
@@ -116,6 +125,13 @@ def _normalize_colors(doc) -> None:
                     color.rgb = RGBColor(0x00, 0x00, 0x00)
             except Exception:  # noqa: BLE001 - warna tak terbaca: lewati
                 pass
+
+    def fix_blue_elements(root):
+        """Semua <w:color w:val="00B0F0"> di bawah `root` -> hitam."""
+        for color_el in root.findall(".//w:color", _NS):
+            if (color_el.get(qn("w:val")) or "").upper() == _BLUE:
+                color_el.set(qn("w:val"), "000000")
+
     for para in doc.paragraphs:
         fix_runs(para.runs)
     for tbl in doc.tables:
@@ -123,11 +139,20 @@ def _normalize_colors(doc) -> None:
             for cell in row.cells:
                 for para in cell.paragraphs:
                     fix_runs(para.runs)
-    # textbox (judul sampul) - XML langsung
-    for para in doc.paragraphs:
-        for color_el in para._p.findall(".//w:txbxContent//w:color", _NS):
-            if (color_el.get(qn("w:val")) or "").upper() == _BLUE:
-                color_el.set(qn("w:val"), "000000")
+
+    # (1) seluruh document.xml: run, tanda paragraf (w:pPr/w:rPr), textbox sampul
+    fix_blue_elements(doc.element.body)
+
+    # (2) word/numbering.xml: warna level daftar (a), 1., 1.1, dst.)
+    # NumberingPart ada di paket sebagai part terpisah, bukan di body, jadi
+    # harus diambil lewat document part (NumberingPart.element = root <w:numbering>).
+    try:
+        num_root = doc.part.numbering_part.element
+    except (KeyError, AttributeError, NotImplementedError):
+        num_root = None
+    if num_root is not None:
+        fix_blue_elements(num_root)
+        print("[template_builder] numbering.xml: warna biru level daftar -> hitam")
 
 
 def _replace_toc(doc) -> None:
@@ -205,15 +230,62 @@ def _set_text(para, text: str, bold: bool = False) -> None:
     run.bold = bold
 
 
-def _tag_para(doc_or_parent, tag: str, para=None, p_level: bool = False):
+def _tag_para(doc_or_parent, tag: str, para=None, p_level: bool = False,
+              body_pPr: bool = False):
     """Jadikan `para` paragraf tag {{ tag }}; tanpa para -> paragraf baru.
     p_level=True -> varian paragraf {{p tag }} (docxtpl Subdoc: seluruh
     paragraf diganti konten subdoc - wajib untuk pengetahuan_content yang
-    berisi gambar flowchart)."""
+    berisi gambar flowchart).
+    body_pPr=True -> pPr paragraf diganti pPr body standar (lihat
+    _normalize_body_pPr) - untuk tag KONTEN yang panjang dan mengalir."""
     if para is None:
         para = doc_or_parent.add_paragraph()
     _set_text(para, ("{{p " + tag + " }}") if p_level else ("{{ " + tag + " }}"))
+    if body_pPr:
+        _normalize_body_pPr(para)
     return para
+
+
+# pPr body standar: jarak baris 360 (1,5), baris pertama menjorok 567 twips,
+# rata kiri-kanan - sama dengan {{ kata_pengantar }}. Dipakai untuk tag konten
+# yang panjang supaya tidak mewarisi pPr paragraf CONTOH di template.
+_BODY_PPR_XML = (
+    '<w:pPr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+    '<w:spacing w:after="0" w:line="360" w:lineRule="auto"/>'
+    '<w:ind w:left="426" w:right="-23" w:firstLine="567"/>'
+    '<w:jc w:val="both"/>'
+    '<w:rPr>'
+    '<w:rFonts w:ascii="Bookman Old Style" w:cs="Bookman Old Style" '
+    'w:eastAsia="Bookman Old Style" w:hAnsi="Bookman Old Style"/>'
+    '<w:sz w:val="24"/><w:szCs w:val="24"/>'
+    '</w:rPr>'
+    '</w:pPr>'
+)
+
+
+def _normalize_body_pPr(para) -> None:
+    """Ganti SELURUH pPr paragraf dengan pPr body standar.
+
+    Ronde 18 (komentar reviewer `id=47` "Spacing ny ga seragam" pada BATASAN
+    VARIABEL): `_tag_para` hanya mengganti run, jadi paragraf tag mewarisi pPr
+    paragraf CONTOH tempat ia ditemukan - untuk batasan_variabel itu
+    `numPr numId=25` + `ind left=1134 hanging=425` + `line=240`, sehingga
+    paragrafnya tampak sebagai butir daftar berjarak 1,0 dan tidak sejajar
+    dengan pendahuluan/kata pengantar.
+
+    pPr diganti utuh (bukan ditambal) supaya `numPr`, `pBdr` nil, `shd`, dan
+    `w:ind` contoh tidak ada yang tertinggal. Rangkaian field XML-nya valid
+    menurut skema (spacing -> ind -> jc -> rPr)."""
+    from docx.oxml import parse_xml
+
+    p = para._p
+    old = p.find(qn("w:pPr"))
+    new = parse_xml(_BODY_PPR_XML)
+    if old is not None:
+        old.addprevious(new)
+        p.remove(old)
+    else:
+        p.insert(0, new)
 
 
 def _carries_sectpr(para) -> bool:
@@ -360,13 +432,15 @@ def _delete_between_anchors(doc, start_marker: str, end_marker: str, tag: str,
     _delete(paras[start_i + 1 : end_i])
 
 
-def _replace_by_text(doc, marker: str, count: int, tag: str):
+def _replace_by_text(doc, marker: str, count: int, tag: str,
+                     body_pPr: bool = False):
     """Temukan paragraf berawalan `marker` lalu ubah N paragraf itu + berikutnya
-    menjadi satu paragraf tag {{ tag }}."""
+    menjadi satu paragraf tag {{ tag }}. body_pPr=True -> pPr paragraf tag
+    dinormalkan ke body standar (tag konten panjang, mis. batasan_variabel)."""
     paras = doc.paragraphs
     for i, p in enumerate(paras):
         if p.text.strip().startswith(marker):
-            _tag_para(doc, tag, paras[i])
+            _tag_para(doc, tag, paras[i], body_pPr=body_pPr)
             for extra in paras[i + 1 : i + count]:
                 if extra.text.strip():
                     if _carries_sectpr(extra):
@@ -538,12 +612,16 @@ def build() -> Path:
     )
 
     # ---------- BATASAN VARIABEL: contoh p304-326 ----------
-    _replace_by_text(doc, "Konteks variabel", 23, "batasan_variabel")
+    # body_pPr=True: buang numPr/ind/line=240 warisan paragraf contoh
+    # (komentar reviewer id=47 "Spacing ny ga seragam").
+    _replace_by_text(doc, "Konteks variabel", 23, "batasan_variabel",
+                     body_pPr=True)
 
     # ---------- PANDUAN PENILAIAN: contoh ----------
     # Catatan: paragraf terakhir rentang ini MEMBAWA w:sectPr - _replace_by_text
     # mengosongkannya (bukan menghapus) sehingga section ke-6 tetap utuh.
-    _replace_by_text(doc, "Konteks penilaian", 21, "panduan_penilaian")
+    _replace_by_text(doc, "Konteks penilaian", 21, "panduan_penilaian",
+                     body_pPr=True)
 
     # ---------- NAMA PENYUSUN ----------
     tbl11 = doc.tables[11]

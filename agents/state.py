@@ -32,6 +32,29 @@ STATUS_FAIL = "FAIL"
 STATUS_NEED_HUMAN_REVIEW = "PASS (Need Human Review)"
 
 
+def penyusun_missing(penyusun: dict) -> List[str]:
+    """Field penyusun yang masih kosong.
+
+    Ronde 18: nama + jabatan/profesi WAJIB ada sebelum modul diproduksi -
+    keluhan reviewer pada halaman NAMA PENYUSUN ("Harusnya diisi dulu, sblum
+    dibuat, ini jadi gate sblum mebiatan"). NIP opsional (template tidak
+    punya kolomnya; NIP ditulis menyatu di sel profesi).
+    """
+    p = penyusun or {}
+    return [k for k in ("nama", "profesi") if not str(p.get(k) or "").strip()]
+
+
+def penyusun_ok(modules) -> bool:
+    """True bila ADA modul dan SEMUA-nya punya nama + profesi penyusun.
+
+    Dipakai sebagai gerbang kedua di route_from_map(), sehingga jalur mana pun
+    (HTTP /api/approve, Streamlit app.py, atau pemanggilan graph langsung)
+    tidak bisa diam-diam memproduksi modul tanpa penyusun.
+    """
+    modules = list(modules or [])
+    return bool(modules) and all(not penyusun_missing(m.get("penyusun")) for m in modules)
+
+
 def merge_modules(
     existing: List["ModuleState"],
     new: List["ModuleState"],

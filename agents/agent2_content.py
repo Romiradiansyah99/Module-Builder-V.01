@@ -63,6 +63,7 @@ ATURAN OUTPUT (WAJIB):
 5. STRUKTUR "pengetahuan_content" (WAJIB meniru contoh modul - gaya buku teks):
    - Setiap elemen silabus menjadi SUBBAB: baris judul di awal baris dengan format "1. <redaksi elemen silabus PERSIS karakter-per-karakter>" lalu sub-subbab "1.1 <redaksi butir pengetahuan silabus PERSIS>" untuk tiap butir pengetahuan.
    - Di BAWAH tiap judul, tulis penjelasan multi-paragraf SANGAT DETAIL (2-5 paragraf, masing-masing 3-6 kalimat) untuk pembaca awam: definisi, langkah praktis, contoh nyata di dunia kerja, tips.
+   - EKSPLORASI DEFINISI (ronde 18): setiap istilah teknis, dan KHUSUSNYA setiap ALAT/APD/bahan yang Anda sebut, WAJIB dijelaskan definisinya - apa benda itu, apa fungsinya, bagaimana cara memakainya dengan benar, dan apa risikonya bila diabaikan. DILARANG menyebut nama alat/APD lalu berhenti (mis. hanya menulis "Gunakan helm keselamatan") tanpa penjelasan.
    - Judul subbab HARUS PERSIS redaksi elemen/pengetahuan silabus - bahan audit tim Kemnaker; sistem menimpa judul yang tidak persis, jadi tulis persis dari awal.
    - Baris judul TIDAK boleh digabung dengan paragraf penjelasan (pisahkan \\n).
 6. Konten harus SANGAT DETAIL, bukan bullet points singkat. Pembaca adalah orang yang sangat awam. Untuk bagian pendukung (kamus, referensi, penilaian) cukup ringkas dan padat.
@@ -80,7 +81,9 @@ Sesuaikan isi kotak flowchart dengan langkah kerja subbab/elemen silabus modul i
 10. PASANGAN VERBA (WAJIB): setiap verba pasif pada indikator silabus WAJIB muncul dalam bentuk AKTIF berakar sama pada kolom "pengetahuan" dan "keterampilan" baris yang sama (indikator "Teridentifikasinya dasar, tujuan..." -> "mengidentifikasi maksud dan tujuan..."; "dicatat" -> "mencatat"). DILARANG memakai kata pasif "ter-" di pengetahuan/keterampilan; verba pasif hanya untuk indikator. Kolom "keterampilan" DILARANG kosong dan DILARANG hanya "." / spasi / placeholder - WAJIB berawal verba AKTIF pasangan indikator baris yang sama (mis. indikator "Terperiksanya ..." -> keterampilan "Memeriksa ...").
 11. QUERY GAMBAR (WAJIB, ronde 15): sistem mengisi dokumen dengan GAMBAR (foto internet atau gambar hasil AI via Replicate), dan Anda yang menentukan query beserta modenya. RELEVANSI KETAT: setiap gambar wajib menggambarkan ISI SUBBAB itu sendiri - bila query tidak menggambarkan aktivitas konkret subbab, gambar akan ditolak sistem:
     - "cover_image_query": untuk COVER PAGE - STRING atau object {{"query": "...", "mode": "..."}} - scene/objek FISIK yang paling mewakili pekerjaan inti modul ini. Bahasa Inggris, deskripsi scene konkret (mis. modul penerimaan sampah -> "garbage truck weighing on weighbridge scale at landfill").
-    - "image_queries" (LIST OF OBJECTS): SATU object PER subbab elemen, key: "subbab" (nomor elemen, mis. "1"), "query" (deskripsi scene bahasa Inggris 6-10 kata yang menggambarkan aktivitas SPESIFIK subbab itu - subjek fisik + aksi + tempat), "judul" (caption bahasa Indonesia yang menyebut aktivitas subbab), "mode" ("cari" atau "generate"). Jumlah objek = jumlah subbab elemen.
+    - "image_queries" (LIST OF OBJECTS): key: "subbab" (nomor subbab, mis. "1" ATAU nomor sub-subbab, mis. "1.4"), "query" (deskripsi scene bahasa Inggris 6-10 kata yang menggambarkan aktivitas SPESIFIK bagian itu - subjek fisik + aksi + tempat), "judul" (caption bahasa Indonesia yang menyebut aktivitas bagian itu), "mode" ("cari" atau "generate").
+      * WAJIB satu objek untuk SETIAP subbab elemen (nomor "1", "2", ...) - jumlahnya = jumlah elemen silabus.
+      * WAJIB TAMBAHAN satu objek untuk SETIAP sub-subbab pengetahuan yang menyebut ALAT/APD/bahan (nomor "1.1", "1.4", ...), dengan query yang MENYEBUT BENDA FISIKNYA: helm, sepatu safety, rompi, sarung tangan, alat tulis, kertas, lembar instruksi kerja, contoh alat kerjanya. Sub-subbab tanpa alat/bahan tidak perlu entri tambahan.
     - ATURAN QUERY: HARUS menyebut objek/benda FISIK yang terlibat di subbab (alat, kendaraan, lokasi, orang yang bekerja). Query abstrak tanpa objek fisik (mis. hanya "document checking", "report data", "administration") DILARANG - menghasilkan gambar yang tidak nyambung. Contoh BENAR utk subbab "Memeriksa dokumen pengiriman sampah": "worker checking waste manifest clipboard beside garbage truck". Contoh SALAH: "checking documents at office".
     - MODE: "cari" = FOTO nyata dari internet - pakai untuk scene berobjek fisik jelas (alat, mesin, kendaraan, lokasi kerja, aktivitas lapangan). "generate" = ilustrasi AI bergaya flat vector profesional - pakai untuk (a) proses abstrak/aliran data yang tak lazim difoto, (b) aktivitas administrasi/kantor yang fotonya jarang cocok (mengisi formulir, mencatat laporan) - untuk generate tulis DESKRIPSI ilustrasi lengkap dgn subjek fisiknya, mis. "worker writing waste reception report at desk with clipboard, computer and stacked documents".
     Query harus SPESIFIK ke alat/proses nyata pada subbab (bukan judul modul yang diulang-ulang)."""
@@ -362,6 +365,23 @@ def _subbab_title_violations(content: str, syllabus_rows: List[dict]) -> List[st
     return _walk_subbab_titles(content, syllabus_rows, fix=False)[1]
 
 
+def _profesi_dengan_nip(penyusun: dict, profesi_key: str = "profesi",
+                        nip_key: str = "nip") -> str:
+    """Gabungkan jabatan/profesi + NIP untuk sel PROFESI tabel penyusun.
+
+    Ronde 18: template hanya punya kolom NO/NAMA/PROFESI, jadi NIP ditulis
+    menyatu ("Jabatan\\nNIP. 1234") - docxtpl Listing merendernya jadi dua
+    baris di sel yang sama, tata letak template tidak berubah.
+    Idempoten: bila profesi sudah memuat NIP (mis. sudah digabung di
+    /api/approve), tidak digandakan.
+    """
+    profesi = str((penyusun or {}).get(profesi_key) or "").strip()
+    nip = str((penyusun or {}).get(nip_key) or "").strip()
+    if nip and "NIP" not in profesi.upper():
+        return f"{profesi}\nNIP. {nip}" if profesi else f"NIP. {nip}"
+    return profesi
+
+
 def _fix_deskripsi_unit(draft_json: dict, module: ModuleState) -> None:
     """Deskripsi unit WAJIB pendek 1 kalimat pola "Terimplementasinya ..."
     (komentar K7: contoh resmi ±130 karakter; kalimat "Peserta mampu..."/
@@ -541,10 +561,14 @@ def agent2_node(module: ModuleState) -> dict:
             # Ronde 12 (K18): evaluasi pengetahuan/praktik = daftar urut silabus.
             _build_evaluasi_lists(draft_json, module.get("syllabus_rows") or [])
             # Ronde 12 (K20): penyusun dari state - tidak diserahkan ke LLM.
+            # Ronde 18: NIP digabung ke sel profesi (template hanya punya kolom
+            # NO/NAMA/PROFESI). "\n" -> docxtpl Listing -> dua baris di sel yang
+            # sama, jadi tata letak template tidak berubah.
             draft_json["nama_penyusun"] = str(penyusun.get("nama") or "").strip() or "-"
-            draft_json["profesi_penyusun"] = str(penyusun.get("profesi") or "").strip() or "-"
+            draft_json["profesi_penyusun"] = _profesi_dengan_nip(penyusun) or "-"
             draft_json["nama_penyusun_2"] = str(penyusun.get("nama2") or "").strip() or "-"
-            draft_json["profesi_penyusun_2"] = str(penyusun.get("profesi2") or "").strip() or "-"
+            draft_json["profesi_penyusun_2"] = _profesi_dengan_nip(
+                penyusun, profesi_key="profesi2", nip_key="nip2") or "-"
             # Ronde 13: query gambar WAJIB ada (foto internet di cover +
             # tiap subbab). LLM yang lupa -> fallback deterministik.
             if not str(draft_json.get("cover_image_query") or "").strip():

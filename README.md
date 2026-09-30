@@ -45,7 +45,14 @@ python -m rag.smoke             # smoke struktural RAG chat (chunker + store)
 python -m rag.smoke --embed     # + ingest/retrieve/delete nyata (embedder lokal)
 python tools/vector_store.py "query"       # tes RAG retrieve manual
 python tools/vector_store.py "query" --force  # rebuild index dari nol
-python tools/word_injector.py    # demo render template (tanpa LLM)
+python -m rag.kb                 # ingest template + contoh modul ke Chroma (idempoten)
+python -m rag.kb --force         # rebuild koleksi KB dari nol
+python -m rag.kb "bagian wajib modul"      # tes retrieve KB saja
+python tools/rag_verify.py       # BUKTI semua koleksi berisi vektor & bisa dicari
+python tools/image_verify.py --selftest    # swap cover tak merusak entry lain (tanpa API)
+python tools/image_verify.py --live        # 1 gambar Replicate sungguhan (berbayar)
+python tools/image_verify.py --docx output/X.docx   # cek cover hasil render
+python -m tools.word_injector    # demo render template (tanpa LLM)
 python main_graph.py             # cetak topologi graph ke konsol
 ```
 
@@ -65,6 +72,49 @@ RAG chat (`rag/`) — blok `# --- RAG CHAT ---` di `.env.example`:
 - `RAG_ANSWER_TEMPERATURE` / `RAG_ANSWER_MAX_TOKENS` / `RAG_REFINE_MAX_TOKENS`.
 - `RAG_PROGRAM_DOC_PATH` — program docx yang otomatis di-index untuk RAG chat.
 
+KB referensi (`rag/kb.py`) — blok `# --- KB REFERENSI ---` di `.env.example`:
+- `RAG_KB_COLLECTION` (default `template_kemnaker`), `RAG_TOP_K_KB` (slot di hasil gabungan).
+- `RAG_KB_INGEST_ON_BOOT` (ingest otomatis saat server menyala), `RAG_KB_INCLUDE_PROGRAM`.
+
+Generate gambar (`tools/image_gen.py`) — blok `# --- GENERATE GAMBAR ---`. Sejak ronde 20
+gambar dibuat **dua tingkat** (dua model berbeda):
+- `REPLICATE_API_TOKEN` — **tanpa ini semua gambar jatuh ke pencarian gambar internet.**
+- `REPLICATE_MODEL` — model **subbab** (default `black-forest-labs/flux-schnell`).
+- `REPLICATE_MODEL_COVER` — model **cover** (default `google/nano-banana-2`), dipanggil sekali per modul.
+- `IMAGE_ASPECT` — rasio gambar subbab.
+- `IMAGE_MODE` — `replicate` (Replicate dulu untuk setiap gambar) / `search` / `auto`.
+- `IMAGE_COVER_MODE` — `replicate` (tukar foto cover template) / `template` (kill switch).
+- `IMAGE_CACHE_DIR` — cache hasil generate (prompt sama tidak dibayar dua kali).
+
+**Skema input berbeda per keluarga model — field milik model lain = HTTP 422.** `image_gen.py`
+memilih payload dari **slug model yang dipanggil** (`_model_family()`); slug yang dikenal selalu
+menang atas override, supaya satu nilai env tak bisa merusak model keluarga lain:
+
+| Keluarga | Model | Field ukuran | Enum ukuran | Env |
+|---|---|---|---|---|
+| `flux` | `black-forest-labs/flux-schnell` | `megapixels` | `"1"` \| `"0.25"` (maks 1 MP) | `IMAGE_MEGAPIXELS` |
+| `gemini` | `google/nano-banana-2` | `resolution` | `1K` \| `2K` \| `4K` | `IMAGE_RESOLUTION`, `IMAGE_COVER_RESOLUTION` |
+| `generic` | apa pun | *(tidak ada)* | hanya `prompt`+`aspect_ratio`+`output_format` | — |
+
+Mengirim `resolution` ke flux, atau `megapixels` ke nano-banana, dijawab **422**. Bila memakai
+model di luar dua keluarga itu, paksa dengan `IMAGE_MODEL_FAMILY` / `IMAGE_MODEL_FAMILY_COVER`
+(`auto|flux|gemini|generic`). Verifikasi **gratis tanpa kredit** (membaca skema kedua model dari
+Replicate lalu mencocokkan tiap field payload): `python tools/image_verify.py --schema`.
+
+`IMAGE_OUTPUT_QUALITY` (0–100) hanya berpengaruh untuk `jpg`/`webp`; `png` diabaikan.
+
+`IMAGE_OUTPUT_FORMAT` (`png` default | `jpg`) menentukan format berkas gambar **subbab**; cover
+selalu JPEG. `png` lossless tapi berat — satu modul dengan 21 gambar ≈ 10 MB, dan berkas sebesar
+itu ikut terunduh tiap kali modul dibuka. `jpg` (quality 88 + optimize) menurunkannya ke ≈ 2 MB
+tanpa beda kasat mata pada kotak template 135×100 mm. Format ikut menjadi kunci cache, jadi
+mengganti nilai ini membuat cache lama tidak terpakai **sekali** (generate ulang = gambar berbayar).
+
+`IMAGE_NET_RETRIES` (default `3`) mengulang panggilan Replicate yang gagal karena **jaringan**
+(ConnectTimeout/ReadTimeout/handshake TLS), dengan jeda 2 s lalu 4 s. Kesalahan HTTP 4xx/5xx
+sengaja **tidak** diulang — itu bug payload/model. Retry ini penting untuk mutu: satu
+ConnectTimeout pernah membuat cover modul jatuh ke foto template lama, dan satu ReadTimeout
+membuat gambar subbab jatuh ke foto internet — keduanya tanpa peringatan yang mencolok.
+
 ## Struktur
 
 ```text
@@ -82,10 +132,15 @@ RAG chat (`rag/`) — blok `# --- RAG CHAT ---` di `.env.example`:
 │   ├── vector_store.py     # RAG ChromaDB + ingest PDF SKKNI
 │   ├── doc_utils.py        # Ekstraksi teks docx + penemuan tag template
 │   ├── template_builder.py # Bangun ulang template docx dengan tag {{ placeholder }}
-│   └── word_injector.py    # docxtpl: draft_json → file .docx
+│   ├── image_gen.py        # Generate gambar + cover via Replicate
+│   ├── image_search.py     # Pencarian gambar internet (jaring pengaman terakhir)
+│   ├── word_injector.py    # docxtpl: draft_json → file .docx (+ tukar cover)
+│   ├── rag_verify.py       # Bukti koleksi Chroma berisi vektor & bisa dicari
+│   └── image_verify.py     # Bukti Replicate jalan & swap cover tak merusak docx
 ├── rag/                    # RAG chat (tanya dokumen) — Rewrite-Retrieve-Read
 │   ├── chat.py             # Orkestrator jawaban streaming (dipakai server.py)
-│   ├── retriever.py        # Retrieve gabungan (rag_chat + skkni_kemnaker)
+│   ├── retriever.py        # Retrieve gabungan (rag_chat + skkni + KB referensi)
+│   ├── kb.py               # Ingest/retrieve KB referensi (template + contoh modul)
 │   ├── rewriter.py         # Tulis-ulang pertanyaan (LLM)
 │   ├── context.py          # create-and-refine / tree-summarization (overflow)
 │   ├── document_manager.py # upload/list/delete + ingest program
@@ -95,7 +150,8 @@ RAG chat (`rag/`) — blok `# --- RAG CHAT ---` di `.env.example`:
 │   └── smoke.py            # Smoke struktural + ingest/retrieve/delete
 └── database/
     ├── skkni_docs/         # PDF SKKNI (sumber RAG)
-    ├── chroma_db/          # Index vector persist
+    ├── contoh_modul/       # Contoh modul (acuan gaya Agent 2 + KB referensi)
+    ├── chroma_db/          # Index vector persist (skkni + rag_chat + KB)
     └── template_kemnaker.docx
 ```
 
@@ -105,3 +161,54 @@ RAG chat (`rag/`) — blok `# --- RAG CHAT ---` di `.env.example`:
 - **HITL:** `interrupt_before=["Map_Modules"]` — graph pause sampai UI set `approved_by_human=True`.
 - **Loop revisi:** Agent 3 FAIL → `Send` balik ke Agent 2 dengan feedback; iterasi ke-3 dipaksa PASS "Need Human Review" (anti infinite-loop).
 - **Tag template dinamis:** Agent 2 menerima daftar tag yang ditemukan otomatis dari template docx — ganti template pun tanpa ubah kode.
+
+### Tiga korpus RAG (bukan satu)
+
+| Koleksi | Isi | Sifat |
+|---|---|---|
+| `skkni_kemnaker` | PDF SKKNI (5953 chunk) | tetap, di-ship di image |
+| `rag_chat` | dokumen unggahan user + program aktif | **mutable** (upload/hapus) |
+| `template_kemnaker` | `template_kemnaker.docx` + `contoh_modul/` (151 chunk) | tetap, referensi |
+
+`rag/retriever.py` menggabungkan ketiganya; `template` dan `contoh_modul` muncul sebagai
+`sources` di jawaban sehingga acuan gaya/struktur ikut tersitasi. Karena korpus contoh modul
+jauh lebih besar dan berprosa asli sementara template hanya 8 chunk ber-`{{ tag }}`, template
+**selalu kalah skor** pada query umum — `rag/kb.py` karena itu menyisipkan satu slot template
+yang dijamin ada (`ENSURE_SOURCE_TYPE`), supaya template benar-benar terpakai dan bukan hanya
+"ada di Chroma tapi tak pernah terambil".
+
+Idempotensi KB memakai `content_hash` (sha1 isi file), **bukan path** — path absolut Windows
+berbeda dari container Linux, sehingga pengecekan berbasis path akan selalu menganggap dokumen
+berubah dan me-re-embed tiap boot.
+
+### Cover page = slot template yang ditukar, bukan gambar baru
+
+Template Kemnaker sudah punya foto cover tertanam: `word/media/image3.jpg` (1400×980 px,
+rasio **10:7**), dirujuk tepat sekali sebagai anchor `behindDoc` berukuran 205.9×144.1 mm di
+belakang textbox judul. Cara lama (fetch foto lalu overlay) **ditolak reviewer** karena
+menutupi gambar template. Ronde 18 menukar **byte** entry itu dengan ilustrasi Replicate:
+posisi, ukuran, dan tata letak textbox tidak bergeser sama sekali, dan gambar dijamin terlihat
+untuk semua panjang judul. Word menghormati extent XML, jadi rasio hasil **harus** persis 10:7
+atau gambar akan gepeng — `generate_cover()` meminta 3:2 lalu memotong lokal ke 10:7.
+
+Keutuhan dokumen dijaga `_swap_zip_entry()`: semua entry disalin dalam urutan asli memakai
+`ZipInfo` aslinya (date_time/compress_type/external_attr ikut terjaga), `[Content_Types].xml`
+tidak pernah ditulis ulang. `python tools/image_verify.py --selftest` membuktikan hanya entry
+cover yang berubah — tanpa perlu kredit Replicate.
+
+Rantai fallback gambar tidak boleh putus: Replicate → pencarian gambar internet → dan bila
+keduanya gagal, **cover template dibiarkan apa adanya**. Injeksi `.docx` tidak pernah gagal
+karena generator gambar.
+
+**Model gambar, dua tingkat (ronde 20).** Gambar subbab dibuat `black-forest-labs/flux-schnell`
+(≈$0.003/gambar, ~11× lebih murah dari `google/nano-banana-2`). Pertimbangannya bukan hanya harga:
+gaya gambar di modul ini menuntut *wordless artwork* (teks yang muncul di ilustrasi justru pernah
+jadi masalah), jadi keunggulan utama nano-banana — rendering teks yang akurat — memang sengaja
+tidak dipakai di sana. **Cover justru sebaliknya**, dan itu satu-satunya gambar yang memakai
+nano-banana: cover dicetak pada 205,9 mm dan hanya dibuat **sekali per modul**, sementara
+`flux-schnell` mentok di 1 MP (`megapixels` maks `"1"`) sehingga cover 10:7-nya hanya ≈1189×832 px
+— **lebih lunak daripada foto template yang digantikannya** (1400×980 px ≈ 173 dpi). Pada
+`IMAGE_COVER_RESOLUTION=2K`, nano-banana memberi 2528×1696 px yang di-crop ke **2423×1696 px**
+(≈299 dpi pada 205,9 mm), jadi cover hasil generate justru **lebih tajam** dari template. Biaya naik dari ≈$0.018 menjadi ≈$0.054 per modul (6 gambar) —
+masih jauh di bawah satu modul nano-banana penuh (≈$0.23). Verifikasi gratis tanpa kredit:
+`image_verify.py --schema`.

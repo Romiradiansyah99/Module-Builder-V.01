@@ -25,7 +25,13 @@ TEMPLATE_PATH = _PROJECT_ROOT / os.getenv(
     "TEMPLATE_PATH", "database/template_kemnaker.docx"
 )
 PROGRAM_DOC_PATH = os.getenv("PROGRAM_DOC_PATH", "")
-EXAMPLE_MODULES_DIR = os.getenv("EXAMPLE_MODULES_DIR", "")
+# Rilis 18: resolve terhadap root proyek seperti TEMPLATE_PATH/OUTPUT_DIR.
+# Sebelumnya string relatif mentah -> hanya benar bila CWD == root proyek
+# (server/Docker kebetulan begitu, tapi skrip dari direktori lain tidak).
+# Tetap bertipe str agar tetap FALSY saat env kosong - `get_example_module_text`
+# memakai `if not EXAMPLE_MODULES_DIR`, dan Path apa pun selalu truthy.
+_EXAMPLE_DIR_RAW = (os.getenv("EXAMPLE_MODULES_DIR") or "").strip()
+EXAMPLE_MODULES_DIR = str(_PROJECT_ROOT / _EXAMPLE_DIR_RAW) if _EXAMPLE_DIR_RAW else ""
 OUTPUT_DIR = _PROJECT_ROOT / os.getenv("OUTPUT_DIR", "output")
 
 # ----------------------------------------------------------------------
@@ -435,6 +441,17 @@ def get_example_module_text() -> str:
     if not files:
         return ""
     return extract_docx_text(files[0], max_chars=12000)
+
+
+def list_example_modules() -> List[Path]:
+    """Semua contoh modul .docx, urut nama (urutan stabil utk doc_id KB).
+
+    Dipakai rag/kb.py agar indeks referensi memakai urutan yang bisa
+    direproduksi (bukan urutan filesystem yang tak dijamin).
+    """
+    if not EXAMPLE_MODULES_DIR:
+        return []
+    return sorted(Path(EXAMPLE_MODULES_DIR).glob("*.docx"))
 
 
 def template_info() -> Dict:

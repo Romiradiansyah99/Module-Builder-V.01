@@ -155,14 +155,31 @@ def _deterministic_violations(draft_json: dict,
                 "foto COVER PAGE (mis. \"steam power plant surface condenser\")."
             )
         iq = draft_json.get("image_queries")
-        n_iq = len(iq) if isinstance(iq, list) else 0
-        if n_iq < n_elemen:
+        iq_list = [x for x in iq if isinstance(x, dict)] if isinstance(iq, list) else []
+        # Ronde 18 (WS4): hitungan dipisah subbab ("1") vs sub-subbab ("1.1").
+        # Syarat lama (satu entri per elemen) hanya berlaku utk subbab; entri
+        # sub-subbab bersifat TAMBAHAN (gambar alat/APD, komentar reviewer id=7).
+        keys = [str(x.get("subbab") or x.get("no") or "").strip().rstrip(".")
+                for x in iq_list]
+        n_sub = len([k for k in keys if k and "." not in k])
+        if n_sub < n_elemen:
             violations.append(
-                f'Key "image_queries" hanya berisi {n_iq} objek, harus SATU PER '
-                f"SUBBAB ELEMEN ({n_elemen} elemen). Bentuk: [{{\"subbab\": \"1\", "
-                '"query": "<kata kunci gambar bahasa Inggris sesuai isi subbab>", '
-                '"judul": "<judul gambar bahasa Indonesia untuk caption>"}], ...].'
+                f'Key "image_queries" hanya berisi {n_sub} entri SUBBAB ELEMEN, '
+                f"harus SATU PER SUBBAB ELEMEN ({n_elemen} elemen). Bentuk: "
+                '[{"subbab": "1", "query": "<kata kunci gambar bahasa Inggris '
+                'sesuai isi subbab>", "judul": "<judul gambar bahasa Indonesia '
+                'untuk caption>"}], ...].'
             )
+        # CATATAN (ronde 18, WS4): entri `image_queries` ber-key sub-subbab
+        # ("1.4") SENGAJA tidak dijadikan pelanggaran yang memblokir.
+        # Alasannya terukur: `_maybe_photo` sudah MENJAMIN tiap sub-subbab
+        # dapat gambar (query jatuh ke judul sub-subbab bila entri tidak ada),
+        # jadi kuantitas gambar yang diminta reviewer id=7 tetap terpenuhi.
+        # Sebaliknya, menjadikannya pelanggaran membuat Agent 3 FAIL berulang
+        # saat LLM mengabaikannya - satu percobaan penuh menghasilkan 3 iterasi
+        # (dua panggilan Agent 2 ekstra, ~19k token masing-masing) hanya untuk
+        # menaikkan kualitas kata kunci. Instruksi kualitasnya tetap ada di
+        # rule 11 prompt Agent 2; yang memblokir cukup kuantitas SUBBAB.
         # K18: evaluasi pengetahuan/praktik = daftar bernomor "1) ...".
         for key, pola in (
             ("evaluasi_pengetahuan", 'daftar bernomor "1) Pengetahuan tentang '

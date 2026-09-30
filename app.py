@@ -16,7 +16,7 @@ from pathlib import Path
 
 import streamlit as st
 
-from agents.state import STATUS_NEED_HUMAN_REVIEW
+from agents.state import STATUS_NEED_HUMAN_REVIEW, penyusun_missing
 from tools.doc_utils import OUTPUT_DIR, template_info
 
 st.set_page_config(page_title="Kemnaker Module Builder", page_icon="📚", layout="wide")
@@ -126,10 +126,30 @@ def render_syllabus_panel():
             else:
                 st.markdown(m["syllabus_content"])
 
+    # Ronde 18: NAMA PENYUSUN adalah GATE (bukan cuma field opsional) - modul
+    # tidak boleh diproduksi tanpa nama + jabatan penyusun.
+    st.markdown("**👤 Penyusun modul (wajib)** — tercetak di halaman Daftar Nama Penyusun.")
+    existing = dict((modules[0].get("penyusun") or {})) if modules else {}
+    p1, p2, p3 = st.columns(3)
+    nama = p1.text_input("Nama penyusun *", value=existing.get("nama", ""))
+    profesi = p2.text_input("Jabatan / profesi *", value=str(existing.get("profesi", "")).split("\n")[0])
+    nip = p3.text_input("NIP (opsional)", value=existing.get("nip", ""))
+    p4, p5, p6 = st.columns(3)
+    nama2 = p4.text_input("Nama penyusun kedua", value=existing.get("nama2", ""))
+    profesi2 = p5.text_input("Jabatan / profesi kedua", value=str(existing.get("profesi2", "")).split("\n")[0])
+    nip2 = p6.text_input("NIP kedua", value=existing.get("nip2", ""))
+    penyusun = {"nama": nama.strip(), "profesi": profesi.strip(), "nip": nip.strip(),
+                "nama2": nama2.strip(), "profesi2": profesi2.strip(), "nip2": nip2.strip()}
+    missing = penyusun_missing(penyusun)
+
     left, right = st.columns([1, 2])
     with left:
-        if st.button("✅ APPROVE — Mulai Produksi Modul", type="primary", use_container_width=True):
-            approve_and_run(modules)
+        if st.button("✅ APPROVE — Mulai Produksi Modul", type="primary",
+                     use_container_width=True, disabled=bool(missing)):
+            approve_and_run(modules, penyusun)
+        if missing:
+            st.caption("Isi dulu: " + ", ".join(
+                {"nama": "Nama penyusun", "profesi": "Jabatan/profesi"}.get(k, k) for k in missing))
     with right:
         with st.form("revisi_form"):
             feedback = st.text_area("Atau minta revisi (opsional):", placeholder="Contoh: tambahkan modul tentang K3, alokasi waktu kurang pas...")
@@ -142,9 +162,20 @@ def render_syllabus_panel():
                 st.rerun()
 
 
-def approve_and_run(modules):
-    """Set approved_by_human=True lalu resume graph (fan-out paralel)."""
-    graph.update_state(get_config(), {"approved_by_human": True})
+def approve_and_run(modules, penyusun: dict = None):
+    """Tulis penyusun + approved_by_human=True lalu resume graph (fan-out paralel).
+
+    Ronde 18: daftar modul dikirim LENGKAP karena reducer merge_modules
+    MENGGANTI dict per module_id (modul parsial akan menghapus draft_json).
+    """
+    penyusun = dict(penyusun or {})
+    if penyusun:
+        from agents.agent2_content import _profesi_dengan_nip
+
+        penyusun["profesi"] = _profesi_dengan_nip(penyusun)
+        penyusun["profesi2"] = _profesi_dengan_nip(penyusun, "profesi2", "nip2")
+    full_modules = [{**m, "penyusun": penyusun} for m in (modules or [])]
+    graph.update_state(get_config(), {"modules": full_modules, "approved_by_human": True})
     st.session_state.phase = "running"
     events = []
     progress = st.progress(0.0, text="Produksi modul berjalan (Agent 2 paralel per modul → evaluasi → rakit .docx)...")

@@ -35,6 +35,7 @@ from tools.unit_extractor import (
     format_units_markdown,
     get_units_block,
     match_unit,
+    rank_units,
     rows_status,
 )
 from tools.vector_store import format_context, get_retriever
@@ -72,6 +73,13 @@ ASK_INTENT_DRAFT_RE = re.compile(
 _ROW_PROMPT_KEYS = ("elemen_no", "elemen", "kuk_no", "kuk", "indikator",
                     "pengetahuan", "keterampilan", "durasi")
 
+# --- Pemilihan cakupan lewat JUDUL unit (bukan cuma nomor) -------------------
+# Ambang skor judul. Jalur ambigu sengaja MEMILIH BERTANYA daripada menebak:
+# salah pilih unit berarti seluruh modul dibangun untuk unit yang salah.
+_TITLE_STRONG = 0.85   # skor >= ini (dan unggul jauh dari peringkat 2) -> pilih
+_TITLE_GAP = 0.12      # selisih minimal ke peringkat 2 agar tidak disebut ambigu
+_NUMBER_RE = re.compile(r"\b\d+\.\d+\b")
+
 HISTORY_CAP = 12  # pesan terakhir yang dimasukkan ke prompt (anti bloat)
 
 # Konteks peserta (ronde 6, PENTING): user sudah menegaskan peserta pelatihan
@@ -106,7 +114,7 @@ SYSTEM_PROMPT = """Anda adalah Ahli Kurikulum Kemnaker. Program pelatihan dan da
 
 Tugas Anda menjalankan dua mode:
 
-1. mode "ask": user BELUM memilih cakupan (belum menjawab "semua unit" atau menyebut nomor unit). Kembalikan modules: [] dan tulis `reply` berupa kalimat pembuka + daftar unit yang bisa dipilih + pertanyaan "Mau dibuatkan semua unit kompetensi atau beberapa unit saja?".
+1. mode "ask": user BELUM memilih cakupan (belum menjawab "semua unit", menyebut nomor unit, atau menyebut JUDUL unit). Kembalikan modules: [] dan tulis `reply` berupa kalimat pembuka + daftar unit yang bisa dipilih + pertanyaan "Mau dibuatkan semua unit kompetensi atau beberapa unit saja?" - sebutkan bahwa user boleh menjawab dengan nomor ATAU judul unitnya.
 
 2. mode "build": user SUDAH memilih cakupan ("semua", nomor unit seperti 1.1/2.3, kelompok, judul unit, atau "ya" untuk program draft). Buat TEPAT satu modul per unit terpilih dengan ketentuan:
    - PROGRAM DRAFT (DAFTAR UNIT kosong): usulkan sendiri daftar unit kompetensi yang relevan dari isi program; module_title = usulan Anda; isi syllabus_rows penuh dari referensi SKKNI; tentukan alokasi_waktu sendiri ("N JP @ 45 menit").
@@ -258,13 +266,75 @@ def _apply_jp_rules(rows: List[dict], alokasi: str) -> Tuple[List[dict], str]:
     return rows, f"{total} JP @ 45 menit"
 
 
-def _scope_answered(history: List[dict], allow_affirmative: bool = False) -> bool:
+def _scope_from_text(text: str, units: List[dict]) -> Tuple[List[str], List[dict]]:
+    """Baca pilihan cakupan dari kalimat bebas user.
+
+    Return (unit_no, ambigu):
+    - unit_no non-kosong -> user sudah memilih dengan JELAS (nomor unit, atau
+      judul unit yang cocok kuat).
+    - ambigu non-kosong -> judul cocok ke >1 unit; TANYAKAN, jangan menebak.
+    - keduanya kosong -> bukan pilihan cakupan ("semua"/kelompok ditangani
+      ASK_INTENT_RE; sisanya biarkan tahap dig).
+
+    Urutannya disengaja: nomor eksplisit selalu menang (deterministik), baru
+    judul dinilai dengan skor.
+    """
+    text = (text or "").strip()
+    if not text or not units:
+        return [], []
+
+    # 1) Nomor unit eksplisit - tidak pernah ambigu.
+    valid_nos = {u["no"] for u in units}
+    picked = [n for n in _NUMBER_RE.findall(text) if n in valid_nos]
+    if picked:
+        return picked, []
+
+    # 2) Kata kunci cakupan ("semua unit", "kelompok inti") - bukan urusan judul.
+    if re.search(r"semua\s+(unit|modul)|seluruh\s+unit|kelompok\s+(inti|pilihan)",
+                 text, re.I):
+        return [], []
+
+    # 3) Judul unit di dalam kalimat bebas (mis. "Buatkan modul untuk unit
+    #    Membantu Pengoperasian Unit Pembangkit bagi Pelaksana Muda").
+    ranked = rank_units(units, text)
+    if not ranked:
+        return [], []
+    top_unit, top_score = ranked[0]
+    second_score = ranked[1][1] if len(ranked) > 1 else 0.0
+    if top_score >= 0.99:
+        return [top_unit["no"]], []
+    if top_score >= _TITLE_STRONG and (top_score - second_score) >= _TITLE_GAP:
+        return [top_unit["no"]], []
+    return [], [u for u, _ in ranked]
+
+
+def _ambiguous_reply(candidates: List[dict]) -> str:
+    """Balasan saat judul user cocok ke beberapa unit - minta nomornya.
+
+    Sengaja TIDAK memilih sendiri: salah unit = seluruh modul salah.
+    """
+    return "\n".join([
+        SCOPE_MARKER,
+        "Judul yang Anda sebut cocok dengan lebih dari satu unit kompetensi:",
+        "",
+        format_units_markdown(candidates),
+        "",
+        "Nomor mana yang Anda maksud? Sebutkan nomornya (mis. "
+        f"`{candidates[0]['no']}`) atau tulis judul lengkapnya.",
+    ])
+
+
+def _scope_answered(history: List[dict], allow_affirmative: bool = False,
+                    units: List[dict] = None) -> bool:
     """True jika agent sudah pernah bertanya (marker) DAN user membalas
-    dengan jawaban cakupan (nomor unit / 'semua' / kelompok).
+    dengan jawaban cakupan (nomor unit, JUDUL unit, 'semua', atau kelompok).
 
     allow_affirmative=True dipakai saat program DRAFT tanpa daftar unit -
     di situ pertanyaannya "mau saya usulkan unitnya?" sehingga jawaban
-    "ya/ok/silakan" juga sah sebagai pilihan cakupan."""
+    "ya/ok/silakan" juga sah sebagai pilihan cakupan.
+
+    units opsional: bila diberikan, JUDUL unit juga diakui sebagai jawaban
+    cakupan (lihat _scope_from_text)."""
     asked = any(
         m.get("role") == "assistant" and SCOPE_MARKER in (m.get("content") or "")
         for m in history
@@ -272,10 +342,17 @@ def _scope_answered(history: List[dict], allow_affirmative: bool = False) -> boo
     if not asked:
         return False
     intent = ASK_INTENT_DRAFT_RE if allow_affirmative else ASK_INTENT_RE
-    return any(
-        intent.search(m.get("content") or "")
-        for m in history if m.get("role") == "user"
-    )
+    for m in history:
+        if m.get("role") != "user":
+            continue
+        content = m.get("content") or ""
+        if intent.search(content):
+            return True
+        if units:
+            nos, _ = _scope_from_text(content, units)
+            if nos:
+                return True
+    return False
 
 
 def _ask_reply(program_title: str, units: List[dict]) -> str:
@@ -297,7 +374,9 @@ def _ask_reply(program_title: str, units: List[dict]) -> str:
         format_units_markdown(units),
         "",
         "Mau dibuatkan **semua unit kompetensi**, atau **beberapa unit saja**? "
-        "Sebutkan nomornya (mis. `1.1` dan `2.1`) atau ketik `semua`.",
+        "Sebutkan nomornya (mis. `1.1` dan `2.1`) **atau tulis judul unitnya** "
+        "(mis. `Membantu Pengoperasian Unit Pembangkit bagi Pelaksana Muda`), "
+        "atau ketik `semua`.",
     ]
     return f"{SCOPE_MARKER}\n" + "\n".join(lines)
 
@@ -318,10 +397,10 @@ DIG_PROMPT = """Anda adalah Konsultan Kurikulum Kemnaker yang ramah dan berpenga
 {style}
 CARA MEMBALAS (seperti manusia, bukan robot):
 1. JAWAB DULU apa yang user tanyakan/katakan secara wajar berdasarkan info di atas - jangan mengarang data di luar konteks program.
-2. Lalu, bila kebutuhan masih mengambang, ajukan MAKSIMAL 2 pertanyaan penggalian yang paling penting: tujuan pelatihan, unit yang diutamakan, alokasi waktu, atau NAMA & PROFESI penyusun modul (data ini wajib dikumpulkan sebelum modul dibangun - dicantumkan pada halaman daftar nama penyusun). Jangan mengulang pertanyaan yang sudah terjawab. DILARANG bertanya "siapa peserta pelatihannya" - peserta sudah diketahui orang awam (lihat konteks di atas).
+2. Lalu, bila kebutuhan masih mengambang, ajukan MAKSIMAL 2 pertanyaan penggalian yang paling penting: tujuan pelatihan, unit yang diutamakan, alokasi waktu, atau NAMA, JABATAN/PROFESI, dan NIP penyusun modul (data ini WAJIB dikumpulkan sebelum modul dibangun - dicantumkan pada halaman daftar nama penyusun). Jangan mengulang pertanyaan yang sudah terjawab. DILARANG bertanya "siapa peserta pelatihannya" - peserta sudah diketahui orang awam (lihat konteks di atas).
 3. Ringkas dan hangat: 2-5 kalimat, bahasa Indonesia santai-formal. Jangan tampilkan seluruh daftar unit lagi bila sudah pernah ditampilkan.
 4. INISIATIF proaktif: bila ada unit dengan tabel acuan "BELUM LENGKAP" atau "belum ada", beri tahu user secara singkat dan TAWARKAN mengisi sendiri dari referensi SKKNI (contoh: "Indikator unit 1.1 masih kosong - mau saya isi sendiri dari SKKNI, atau memang tidak perlu?"). Jangan tunggu user menyadari kekosongannya.
-5. Pilih mode "build" HANYA bila user sudah jelas meminta dibuatkan (mis. "lanjut", "buat semua unit", menyebut nomor unit, atau menyetujui tawaran pengisian) ATAU kebutuhannya sudah lengkap dan menyuruh Anda memulai. Selain itu mode "dig".
+5. Pilih mode "build" HANYA bila user sudah jelas meminta dibuatkan (mis. "lanjut", "buat semua unit", menyebut nomor unit, MENYEBUT JUDUL UNIT dari daftar di atas, atau menyetujui tawaran pengisian) ATAU kebutuhannya sudah lengkap dan menyuruh Anda memulai. Selain itu mode "dig". Bila user menyebut judul unit yang cocok ke LEBIH DARI SATU unit di daftar, JANGAN memilih sendiri - tanyakan nomornya (mode tetap "dig").
 {dig_note}
 {first_note}
 ATURAN OUTPUT (WAJIB - jawab HANYA satu objek JSON, tanpa teks lain):
@@ -361,7 +440,8 @@ def _dig_turn(program_title: str, units: List[dict], history: List[dict]) -> Tup
     dig_count = sum(1 for m in history if m.get("role") == "assistant")
     dig_note = (
         "5. Anda SUDAH menggali beberapa giliran - sekarang ajak user memutuskan: "
-        "tawarkan membangun SELURUH unit sebagai asumsi terbaik, atau sebutkan unit pilihannya."
+        "tawarkan membangun SELURUH unit sebagai asumsi terbaik, atau sebutkan unit "
+        "pilihannya (boleh dengan nomor ATAU judul unitnya)."
         if dig_count >= 3 else ""
     )
     # Ronde 6: giliran PERTAMA jangan mengasumsikan program yang sudah
@@ -376,9 +456,10 @@ def _dig_turn(program_title: str, units: List[dict], history: List[dict]) -> Tup
             "sama sekali baru. Tanyakan dulu program apa yang mau dibuatkan modulnya, lalu "
             "tawarkan pilihan: memakai program yang sudah tersedia di sistem, atau upload "
             "program miliknya sendiri. Jangan menyebut judul program sebagai keputusan final. "
-            "SEKALIGUS tanyakan NAMA & PROFESI penyusun modul (mis. 'Boleh tahu siapa yang "
-            "akan tercantum sebagai penyusun modul ini - nama dan profesinya?'), karena "
-            "data itu wajib ada sebelum modul dibangun."
+            "SEKALIGUS tanyakan NAMA, JABATAN/PROFESI, dan NIP penyusun modul (mis. "
+            "'Boleh tahu siapa yang akan tercantum sebagai penyusun modul ini - nama, "
+            "jabatan/profesi, dan NIP-nya?'), karena data itu wajib ada sebelum modul "
+            "dibangun dan tidak bisa dikosongkan."
         )
 
     prompt = DIG_PROMPT.format(
@@ -424,18 +505,21 @@ def parse_agent1_json(text: str) -> dict:
     return {"program_name": program_name, "reply": reply, "raw_modules": raw}
 
 
-_PENYUSUN_PROMPT = """Dari RIWAYAT PERCAKAPAN berikut, ekstrak data PENYUSUN modul yang disebut user (nama dan profesi - mis. instruktur, dosen, teknisi). RIWAYAT PERCAKAPAN:
+_PENYUSUN_PROMPT = """Dari RIWAYAT PERCAKAPAN berikut, ekstrak data PENYUSUN modul yang disebut user (nama, jabatan/profesi - mis. instruktur, dosen, teknisi - dan NIP bila disebut). RIWAYAT PERCAKAPAN:
 {history}
 
 ATURAN OUTPUT (WAJIB - jawab HANYA satu objek JSON tanpa teks lain):
-{{"nama": "<nama penyusun pertama>", "profesi": "<profesi penyusun pertama>", "nama2": "<nama penyusun kedua bila ada>", "profesi2": "<profesi penyusun kedua bila ada>"}}
+{{"nama": "<nama penyusun pertama>", "profesi": "<jabatan/profesi penyusun pertama>", "nip": "<NIP penyusun pertama bila disebut>", "nama2": "<nama penyusun kedua bila ada>", "profesi2": "<jabatan/profesi penyusun kedua bila ada>", "nip2": "<NIP penyusun kedua bila ada>"}}
 Isi string kosong "" bila data tidak pernah disebut dalam percakapan - JANGAN mengarang."""
 
 
 def _extract_penyusun(history: List[dict]) -> dict:
     """Ronde 12 (K20): tarik data penyusun dari percakapan penggalian
     (Agent 1 menanyakanya sejak giliran pertama). Gagal LLM -> dict kosong
-    (Agent 2 menulis "-" pada tabel penyusun, tidak pernah crash)."""
+    (Agent 2 menulis "-" pada tabel penyusun, tidak pernah crash).
+
+    Ronde 18: menambah NIP. Hasilnya dipakai untuk MENGISI-AWAL field di
+    gerbang approval (server /api/approve) - user tinggal mengonfirmasi."""
     history_text = "\n".join(
         f"{'USER' if m.get('role') == 'user' else 'ASSISTANT'}: {m.get('content', '')}"
         for m in history[-HISTORY_CAP:]
@@ -451,7 +535,7 @@ def _extract_penyusun(history: List[dict]) -> dict:
         print(f"[agent1] ekstraksi penyusun gagal ({type(exc).__name__}) - dikosongkan")
         return {}
     out = {}
-    for key in ("nama", "profesi", "nama2", "profesi2"):
+    for key in ("nama", "profesi", "nip", "nama2", "profesi2", "nip2"):
         value = str(data.get(key) or "").strip()
         if value and value.lower() not in ("null", "none", "-"):
             out[key] = value
@@ -588,11 +672,23 @@ def agent1_node(state: GlobalState) -> dict:
     units = list(extract_program_units())
     program_title = extract_program_meta().get("judul", "")
 
-    # --- Gerbang build: regex dulu (murah), baru keputusan LLM dig ---
-    build_intent = ASK_INTENT_RE.search(last_user) or (
+    # --- Gerbang build: deterministik dulu (murah), baru keputusan LLM dig ---
+    # Ronde 18: selain nomor unit, JUDUL unit juga sah membuka gerbang -
+    # user tidak harus hafal nomornya.
+    scope_nos, scope_ambiguous = _scope_from_text(last_user, units)
+    build_intent = bool(scope_nos) or ASK_INTENT_RE.search(last_user) or (
         not units and ASK_INTENT_DRAFT_RE.search(last_user)
     )
-    scope_done = _scope_answered(history, allow_affirmative=not units)
+    scope_done = _scope_answered(history, allow_affirmative=not units, units=units)
+
+    # Judul cocok ke beberapa unit -> tanya dulu, jangan bangun unit yang salah.
+    if scope_ambiguous and not build_intent:
+        return {
+            "modules": [],
+            "program_name": program_title,
+            "chat_history": [{"role": "assistant",
+                              "content": _ambiguous_reply(scope_ambiguous)}],
+        }
     # Ronde 8: begitu silabus SUDAH pernah dibuat, gerbang "scope_done"
     # tidak boleh memaksa SEMUA chat berikutnya masuk build (sumber error
     # "tidak menghasilkan modul apa pun" saat user sekadar ngobrol). Chat

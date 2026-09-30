@@ -251,6 +251,32 @@ def t_unit():
     assert not ASK_INTENT_RE.search("mau tanya dulu")
     assert not ASK_INTENT_RE.search("aku mau bikin modul pelatihan nih"), 'pembuka "bikin" harus tetap masuk dig'
 
+    # b1) Ronde 18: cakupan boleh dipilih lewat JUDUL unit, bukan hanya nomor
+    #     ("jangan kaku ke angka aja"). Ambigu WAJIB bertanya, bukan menebak.
+    from agents.agent1_syllabus import _scope_from_text
+    from tools.unit_extractor import extract_program_units, rank_units
+
+    _units = list(extract_program_units())
+    _judul = next(u for u in _units if u["no"] == "1.1")["judul"]
+
+    nos, amb = _scope_from_text("1.1", _units)
+    assert nos == ["1.1"] and not amb, f"nomor unit harus deterministik: {nos} / {amb}"
+    nos, amb = _scope_from_text("buatkan 1.1 dan 2.1", _units)
+    assert nos == ["1.1", "2.1"], f"beberapa nomor: {nos}"
+    nos, amb = _scope_from_text(f"Buatkan modul untuk unit {_judul}", _units)
+    assert nos == ["1.1"] and not amb, f"judul utuh harus terpilih: {nos} / {amb}"
+    nos, amb = _scope_from_text(_judul.lower(), _units)
+    assert nos == ["1.1"], f"judul huruf kecil harus terpilih: {nos} / {amb}"
+    assert rank_units(_units, f"Buatkan modul untuk unit {_judul}")[0][1] >= 0.9, \
+        "judul utuh di dalam kalimat harus berskor tinggi"
+    # kalimat tanpa rujukan unit -> tetap percakapan (jangan salah bangun modul)
+    for _chat in ("aku mau bikin modul pelatihan nih", "halo", "tolong buatkan modul tentang keselamatan"):
+        _nos, _amb = _scope_from_text(_chat, _units)
+        assert not _nos and not _amb, f"kalimat {_chat!r} jangan dianggap pilihan unit"
+    assert _scope_answered([{"role": "assistant", "content": f"x {SCOPE_MARKER}"},
+                            {"role": "user", "content": f"modul {_judul}"}], units=_units), \
+        "judul unit harus diakui sebagai jawaban cakupan"
+
     # b2) pengetahuan bernomor urut "1. " (feedback ronde 2 item 2)
     from tools.doc_utils import number_pengetahuan
 
@@ -397,6 +423,107 @@ def t_inject():
 step("9. Demo inject docxtpl", t_inject)
 
 
+# --- 9b. Ronde 18: gerbang penyusun + normalisasi docx pasca-render ---------
+def t_gates_and_normalize():
+    # a) Gerbang PENYUSUN: dua lapis (main_graph + endpoint /api/approve).
+    from agents.state import penyusun_missing, penyusun_ok
+    from main_graph import route_from_map
+
+    assert penyusun_missing({"nama": "A", "profesi": "B"}) == []
+    assert set(penyusun_missing({"nama": " ", "profesi": ""})) == {"nama", "profesi"}
+    assert penyusun_ok([{"module_id": "M01", "penyusun": {"nama": "A", "profesi": "B"}}])
+    assert not penyusun_ok([{"module_id": "M01", "penyusun": {"nama": "A"}}])
+    assert not penyusun_ok([])
+    _ok = [{"module_id": "M01", "penyusun": {"nama": "A", "profesi": "B"}}]
+    _bad = [{"module_id": "M01", "penyusun": {"nama": "", "profesi": "B"}}]
+    assert len(route_from_map({"modules": _ok, "approved_by_human": True})) == 1
+    assert route_from_map({"modules": _bad, "approved_by_human": True}) == [], \
+        "fan-out harus DITOLAK bila penyusun modul belum lengkap"
+    assert route_from_map({"modules": _ok, "approved_by_human": False}) == []
+
+    # Endpoint /api/approve menolak 400 sebelum produksi (tanpa LLM/graph).
+    from fastapi.testclient import TestClient
+
+    import server as _srv
+
+    class _Snap:
+        def __init__(self, values):
+            self.values = values
+
+    class _FakeGraph:
+        def get_state(self, cfg):
+            return _Snap({"modules": [{"module_id": "M01", "penyusun": {}}]})
+
+    _saved_sessions, _saved_graph = dict(_srv.SESSIONS), _srv.get_graph
+    try:
+        _srv.SESSIONS.clear()
+        _srv.SESSIONS["smoke-t"] = {"phase": "approval", "thread_id": "smoke-t"}
+        _srv.get_graph = lambda: _FakeGraph()
+        _cli = TestClient(_srv.app, raise_server_exceptions=False)
+        assert _cli.post("/api/approve/smoke-t",
+                         json={"nama": "", "profesi": ""}).status_code == 400
+        assert _cli.post("/api/approve/smoke-t",
+                         json={"nama": "Romi", "profesi": ""}).status_code == 400
+        assert _cli.post("/api/approve/smoke-t",
+                         json={"nama": "  ", "profesi": "Instruktur"}).status_code == 400
+        _p = _srv.PenyusunIn(nama="Romi Putra", profesi="Instruktur", nip="19690725")
+        assert _p.to_penyusun()["profesi"] == "Instruktur\nNIP. 19690725", _p.to_penyusun()
+    finally:
+        _srv.SESSIONS.clear()
+        _srv.SESSIONS.update(_saved_sessions)
+        _srv.get_graph = _saved_graph
+
+    # b) Normalisasi pasca-render: dokumen buatan sendiri HARUS lolos invarian.
+    from tools.doc_utils import OUTPUT_DIR, TEMPLATE_PATH
+    from tools.docx_invariants import check
+    from tools.word_injector import _normalize_rendered_docx
+
+    _demo = OUTPUT_DIR / "DEMO_demo_render_template.docx"
+    if _demo.exists():
+        _viol = check(_demo)[0]
+        assert not _viol, f"invarian docx dilanggar: {_viol}"
+
+    # c) Normalizer sanggup MEMPERBAIKI dokumen cacat (numbering kedouble +
+    #    numbering hilang + warna biru) - dipakai pada .docx yang rusak.
+    import shutil as _shutil
+    import tempfile as _tmp
+    import zipfile as _zip
+    from pathlib import Path as _Path
+
+    from docx import Document as _Doc
+
+    _src = TEMPLATE_PATH
+    _doc = _Doc(str(_src))
+    _p = _doc.add_paragraph()
+    _xml = ('<w:p xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+            '<w:pPr>'
+            '<w:numPr><w:ilvl w:val="0"/><w:numId w:val="1"/></w:numPr>'
+            '<w:spacing w:after="0" w:line="360" w:lineRule="auto"/>'
+            '<w:ind w:left="1843" w:hanging="360"/>'
+            '<w:rPr><w:color w:val="00B0F0"/></w:rPr></w:pPr>'
+            '<w:r><w:rPr><w:color w:val="00B0F0"/></w:rPr><w:t>1) Helm</w:t></w:r>'
+            '<w:r><w:t xml:space="preserve"> </w:t></w:r>'
+            '<w:r><w:br/><w:t>2) Sepatu</w:t></w:r>'
+            '</w:p>')
+    from docx.oxml import parse_xml as _parse
+
+    _p._p.addprevious(_parse(_xml))
+    _with_tmp = _Path(_tmp.mkdtemp()) / "cacat.docx"
+    _doc.save(str(_with_tmp))
+    _before = check(_with_tmp)[0]
+    assert len(_before) >= 3, f"dokumen uji harus cacat dulu: {_before}"
+    _normalize_rendered_docx(_with_tmp)
+    _after = check(_with_tmp)[0]
+    assert not _after, f"normalizer gagal membersihkan: {_after}"
+    _xml2 = _zip.ZipFile(str(_with_tmp)).read("word/document.xml").decode("utf-8", "replace")
+    assert "1) Helm" not in _xml2 and "Helm" in _xml2, "prefiks ordinal harus dibuang"
+    _shutil.rmtree(_with_tmp.parent, ignore_errors=True)
+    print("      Gerbang penyusun (grafik + HTTP 400) & invarian docx: OK")
+
+
+step("9b. Gerbang penyusun + normalisasi docx (ronde 18)", t_gates_and_normalize)
+
+
 # --- 10. FULL: Agent 3 structured output + mini pipeline -------------------
 if "--full" in sys.argv:
     def t_full():
@@ -459,8 +586,15 @@ if "--full" in sys.argv:
         print(f"      HITL OK - 1 modul: {m0['module_title']} | rows={len(m0['syllabus_rows'])}, "
               f"JP={total_jp}/{alok_jp}, pengetahuan bernomor, next={snapshot.next}")
 
-        # approve + resume sampai END
-        graph.update_state(cfg, {"approved_by_human": True})
+        # approve + resume sampai END.
+        # Ronde 18: gerbang PENYUSUN wajib dilewati lebih dulu. Daftar modul
+        # dikirim LENGKAP karena reducer merge_modules MENGGANTI dict per
+        # module_id - modul parsial akan menghapus draft_json/syllabus_rows.
+        _py = {"nama": "Romi Putra", "profesi": "Instruktur\nNIP. 19690725"}
+        graph.update_state(cfg, {
+            "modules": [{**m, "penyusun": dict(_py)} for m in mods],
+            "approved_by_human": True,
+        })
         for _ in graph.stream(None, cfg, stream_mode="updates"):
             pass
         final = graph.get_state(cfg).values

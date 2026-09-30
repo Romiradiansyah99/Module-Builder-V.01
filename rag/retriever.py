@@ -43,6 +43,18 @@ def rag_retrieve(query: str, k: int = None) -> List[Dict[str, Any]]:
     except Exception as exc:  # noqa: BLE001 - SKKNI gagal jangan menghentikan chat
         print(f"[rag] Retrieve SKKNI gagal (diabaikan): {exc}", flush=True)
 
+    # 3) KB referensi Kemnaker (template + contoh modul). Embedding query
+    # dipakai ulang -> tidak ada embed kedua. `source_type` sudah ikut dari
+    # metadata Chroma, jadi sitasi UI otomatis berlabel "template" /
+    # "contoh_modul" tanpa penandaan manual seperti jalur SKKNI di atas.
+    try:
+        if config.RAG_TOP_K_KB > 0:
+            from rag.kb import kb_retrieve_embedded
+
+            docs.extend(kb_retrieve_embedded(query_embedding, k=config.RAG_TOP_K_KB))
+    except Exception as exc:  # noqa: BLE001 - KB gagal jangan menghentikan chat
+        print(f"[rag] Retrieve KB referensi gagal (diabaikan): {exc}", flush=True)
+
     # Gabung + urutkan by skor
     docs = [d for d in docs if d.get("content", "").strip()]
     docs.sort(key=lambda d: float(d.get("score", 0.0)), reverse=True)

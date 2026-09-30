@@ -54,21 +54,110 @@ Yang **wajib** diisi/dicek di `.env` VPS:
 |---|---|---|
 | `LLM_BASE_URL` | `https://ollama.com` | API ollama.com langsung |
 | `LLM_API_KEY` | **key BARU (dirotasi)** | key lama pernah plaintext di repo lokal — jangan dipakai ulang |
+| `LLM_MODEL` | `deepseek-v4.1-flash:cloud` | model yang sudah **di-retire** menjawab `HTTP 410 Gone` → dig Agent 1 mati senyap (fallback deterministik). ❗ `/api/tags` **tidak bisa dipercaya**: `deepseek-v4-flash:cloud` masih terdaftar di sana padahal di-retire 2026-09-25. Uji dengan panggilan nyata (lihat bawah) |
 | `EMBEDDING_MODEL` | **KOSONG** | ❗ wajib kosong — index chroma_db dibangun dengan MiniLM lokal; embedder remote = RAG rusak senyap |
+| `REPLICATE_API_TOKEN` | token dari replicate.com | ❗ tanpa ini **semua gambar** jatuh ke pencarian gambar internet dan cover tetap foto template |
+| `REPLICATE_MODEL` | `black-forest-labs/flux-schnell` | model **subbab** (banyak gambar/modul) — ~$0.003/gambar, ~11× lebih murah dari nano-banana. **Skema input BEDA per keluarga** — lihat catatan di bawah |
+| `REPLICATE_MODEL_COVER` | `google/nano-banana-2` | model **cover** (1×/modul). flux mentok 1 MP → cover 10:7 hanya ≈1189×832 px, lebih lunak dari template 1400×980 px |
+| `IMAGE_COVER_RESOLUTION` | `2K` | resolusi cover → terukur 2423×1696 px (≈299 dpi pada 205,9 mm), lebih tajam dari template |
 | `APP_PASSWORD_SHA256` | hash SHA-256 sandi tim | |
 | `SESSION_SECRET` | `openssl rand -hex 32` | |
 | `COOKIE_SECURE` | `1` setelah HTTPS aktif | |
+
+Cek cepat bahwa **model LLM** benar-benar hidup — jangan pakai `/api/tags`, uji dengan
+panggilan nyata. Ganti `MODEL` dengan `LLM_MODEL` di `.env`; `HTTP 200` = aman, `410` = sudah
+di-retire (ganti ke model lain, mis. `glm-5.3:cloud`):
+
+```bash
+curl -s -o /dev/null -w "%{http_code}\n" "$LLM_BASE_URL/api/chat" \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"MODEL","messages":[{"role":"user","content":"ok"}],"stream":false}'
+```
+
+Cek cepat bahwa token Replicate benar-benar hidup (1 gambar berbayar):
+
+```bash
+docker compose exec app python tools/image_verify.py --live
+```
+
+**Skema input berbeda per keluarga model — jangan campur field.** `tools/image_gen.py` memilih
+payload dari slug model yang dipanggil, jadi mengganti model tidak perlu ubah kode:
+
+| Keluarga | Field ukuran | Enum | Env |
+|---|---|---|---|
+| `flux` (flux-schnell) | `megapixels` | `"1"`, `"0.25"` | `IMAGE_MEGAPIXELS` |
+| `gemini` (nano-banana-2) | `resolution` | `1K`, `2K`, `4K` | `IMAGE_RESOLUTION`, `IMAGE_COVER_RESOLUTION` |
+| `generic` | *(tidak ada)* | — | `IMAGE_MODEL_FAMILY[_COVER]=generic` |
+
+Mengirim `resolution` ke flux, atau `megapixels` ke nano-banana, dijawab **HTTP 422**.
+Keluarga dideteksi dari slug dan slug yang dikenal **selalu menang** atas override; paksa dengan
+`IMAGE_MODEL_FAMILY` / `IMAGE_MODEL_FAMILY_COVER` hanya bila modelnya di luar yang dikenal.
+
+Verifikasi **gratis tanpa kredit** (baca skema model dari Replicate, lalu cek setiap field
+payload ada di dalamnya — inilah gerbang yang dulu tidak ada sehingga bug field `size`
+tersembunyi 5 ronde):
+
+```bash
+docker compose exec app python tools/image_verify.py --schema
+```
+
+**Dua tingkat itu disengaja.** Subbab = flux-schnell (murah, dipanggil berkali-kali). Cover =
+nano-banana-2 pada `IMAGE_COVER_RESOLUTION=2K` (dipanggil **sekali** per modul) karena
+flux-schnell dibatasi **1 MP** — cover 10:7-nya hanya ≈1189×832 px (≈147 dpi pada lebar
+205,9 mm), **lebih lunak** daripada foto template yang digantikannya (1400×980 px ≈ 173 dpi).
+Dengan 2K, cover jadi 2528×1696 px yang di-crop ke 2423×1696 px (≈299 dpi) — lebih tajam dari
+template. Biaya ≈$0.054/modul
+(6 gambar) versus ≈$0.23 bila seluruh modul memakai nano-banana. Bila ingin menyederhanakan,
+isi `REPLICATE_MODEL_COVER` dengan slug yang sama dengan `REPLICATE_MODEL` — sah, tapi cover
+akan lebih lunak dari template.
+
+## 3b. Ingest KB referensi SEBELUM build
+
+`database/chroma_db/` **ikut di-ship di dalam image** (`Dockerfile` sengaja tidak
+mengecualikannya), dan **bukan volume** — satu-satunya volume adalah `./runtime:/app/runtime`.
+Artinya isi `chroma_db` di dalam image adalah data imutabel, dan **apa pun yang ditulis ke
+sana saat kontainer berjalan akan HILANG** begitu kontainer di-recreate.
+
+Jadi koleksi KB harus sudah terisi **di build context, sebelum** `docker compose build`.
+Lakukan **secara lokal** lalu rsync (langkah 2 memang mengikutkan `database/chroma_db/`):
+
+```bash
+python -m rag.kb            # idempoten: run kedua = 0 embed, 3 skip
+python tools/rag_verify.py  # gerbang: semua koleksi harus 384-d & bisa dicari
+rsync ...                   # langkah 2
+# di VPS:
+docker compose build && docker compose up -d
+```
+
+❗ **Jangan** mengandalkan `docker compose exec app python -m rag.kb` untuk menjadikan KB
+permanen. Perintah itu menulis ke lapisan kontainer yang akan dibuang pada recreate berikutnya,
+dan gejalanya menipu: KB terlihat benar sampai kontainer di-recreate, lalu kembali ke versi
+image tanpa pesan error. `RAG_KB_INGEST_ON_BOOT=1` (default) memang menjalankan ingest saat
+boot, tetapi hasilnya **no-op** selama `content_hash` cocok; bila ia benar-benar meng-embed
+ulang, server mencetak peringatan eksplisit:
+
+```text
+[server] !! KB di-index ULANG saat boot (N dokumen) -> hanya bertahan di kontainer ini.
+```
+
+Konsekuensinya: rebuild image **wajib** setiap kali `database/contoh_modul/` atau
+`template_kemnaker.docx` berubah — index di dalam image tidak ikut menua sendiri.
 
 ## 4. Jalankan
 
 ```bash
 docker compose build
 docker compose up -d
-docker compose logs -f        # tunggu: [server] RAG SKKNI siap.
+docker compose logs -f        # tunggu: [server] RAG SKKNI siap. + [rag.kb] KB referensi siap:
 curl -fsS localhost:8000/healthz
 # Uji konektivitas LLM sekali dari dalam kontainer:
 docker compose exec app python smoke_test.py
+# Bukti ketiga korpus RAG berisi vektor (read-only):
+docker compose exec app python tools/rag_verify.py
 ```
+
+Di `/healthz`: `rag_ready=true` **dan** `kb.error=null`. `KB_INGEST_ON_BOOT` sengaja tidak
+pernah menulis `_rag_error`, sehingga kegagalan KB **tidak bisa** mematikan `/api/chat`.
 
 Buka `http://IP_VPS:8000` → diarahkan ke `/login` → masuk dengan sandi tim.
 
@@ -194,3 +283,21 @@ Semua state yang selamat restart ada di `/opt/kemnaker/runtime/`:
 | Login kembali setiap saat | `SESSION_SECRET` berubah tiap restart | pastikan SESSION_SECRET tetap di `.env` |
 | SSE terasa macet di depan proxy | buffering | Caddy: `flush_interval -1` |
 | Key ditolak (401 dari ollama.com) | key lama dirotasi/mati | perbarui `LLM_API_KEY` di `.env`, `docker compose up -d` |
+| Dig Agent 1 balas template kaku, log `410 Gone` | `LLM_MODEL` sudah di-retire di proxy | uji dengan panggilan nyata di bawah, lalu set `LLM_MODEL` ke model yang menjawab **200**. ❗ Jangan pakai `curl $LLM_BASE_URL/api/tags` sebagai bukti: model yang sudah di-retire masih muncul di daftar itu |
+| **Gambar modul bukan hasil AI** (foto internet / ber-watermark) | `REPLICATE_API_TOKEN` kosong, atau `IMAGE_MODE` bukan `replicate`, atau kredit habis | cek log `[image_gen] Replicate submit gagal (...)`; `docker compose exec app python tools/image_verify.py --live` |
+| Cover masih foto template | `IMAGE_COVER_MODE=template`, kredit habis, atau gangguan jaringan sesaat saat submit cover | pastikan `IMAGE_COVER_MODE=replicate` + kredit cukup. Gangguan jaringan (log: `gangguan jaringan (ConnectTimeout) - ulangi 2/3`) kini diulang otomatis `IMAGE_NET_RETRIES` (default 3); kalau log berakhir `Cover Replicate tidak tersedia`, generate-nya memang gagal total. Verifikasi hasil: `image_verify.py --docx output/X.docx` |
+| Satu-dua gambar subbab jadi foto internet/ber-watermark | Replicate gagal setelah semua retry, jatuh ke jaring pengaman pencarian gambar (log: `Gambar internet OK (wikimedia)`) | lihat baris log tepat sebelum itu untuk sebabnya (`HTTP 402` = kredit, `HTTP 429` = rate limit, `gangguan jaringan` = jaringan). Naikkan `IMAGE_NET_RETRIES` bila jaringannya memang buruk |
+| Satu subbab/subb-subbab **sama sekali** tanpa gambar di dokumen | Replicate **dan** pencarian internet gagal untuk query itu — slotnya sengaja dibiarkan kosong (injeksi `.docx` tidak boleh gagal karena generator gambar) | cari baris `[word_injector] PERINGATAN: tidak ada gambar utk "<query>"` di log — teks query di situ menunjuk slot yang kosong. Sebabnya ada di baris `[image_gen] Replicate submit gagal`/`gangguan jaringan` tepat di atasnya (kredit, rate limit, atau jaringan). Panggilan yang gagal **tidak** diulang di produksi berikutnya dari cache (cache hanya menyimpan hasil sukses) |
+| Log `HTTP 402 Insufficient credit` | kredit Replicate habis | isi di https://replicate.com/account/billing lalu tunggu beberapa menit |
+| Log `HTTP 422` di `[image_gen] Replicate submit gagal` | payload memuat field milik keluarga model lain (`resolution` ke flux / `megapixels` ke nano-banana) | jalankan `image_verify.py --schema`; set `IMAGE_MODEL_FAMILY` sesuai model, atau kosongkan ke `auto` |
+| Log `HTTP 404` | slug `REPLICATE_MODEL` salah (mis. `google/nano-banana-v2` — model tidak ada) | cocokkan dengan slug di replicate.com; `image_verify.py --schema` mencetaknya |
+| Log `HTTP 429` | rate limit (kredit < $5 → 6 req/menit) | turunkan `PRODUCE_CONCURRENCY` ke `1` untuk batch yang banyak gambarnya |
+| Log `HTTP 429 ... rate limit ... less than $5.0 in credit` | kredit < $5 → dibatasi 6 prediksi/menit | normal; naikkan kredit atau turunkan `PRODUCE_CONCURRENCY=1` |
+| Gambar bertambah banyak & biaya Replicate naik | ronde 18 menambah gambar per **sub-subbab** (alat/APD) | `IMAGE_SUBBAB_ENABLED=0` → kembali satu gambar per subbab elemen. Hasil generate di-cache di `IMAGE_CACHE_DIR`, jadi approve-ulang tidak membayar dua kali |
+| Berkas `.docx` hasil unduhan berat (~10 MB) | 21 gambar subbab disimpan sebagai PNG (lossless) | `IMAGE_OUTPUT_FORMAT=jpg` → `docker compose up -d`; dokumen turun ke ~2 MB (ilustrasi di kotak 135×100 mm, mutu tak kasat mata). Cache lama tidak terpakai sekali — lihat baris berikut |
+| Nomor daftar tampil ganda (`1. 1. Melaksanakan…`) | seharusnya tidak terjadi lagi: normalizer ronde 18 membuang prefiks ordinal dari paragraf ber-`numPr` saat render | jalankan `docker compose exec app python tools/docx_invariants.py output/X.docx` — bila masih ada, laporkan (normalizer gagal jalan: cek log `[word_injector] Normalisasi:`) |
+| Baris daftar hanya baris pertama bernomor | sama seperti di atas — paragraf ber-`numPr` yang memuat `<w:br/>` dipecah per baris | idem: `tools/docx_invariants.py` |
+| Nomor daftar / teks masih biru | template lama masih terpakai, atau normalizer tidak jalan | bangun ulang template: `python tools/template_builder.py` (target: 0 `00B0F0` di `document.xml` **dan** `numbering.xml`), lalu cek `tools/docx_invariants.py` |
+| Tombol Approve menolak: "Gerbang penyusun belum lengkap" | Nama + jabatan/profesi penyusun belum diisi di kartu approval | isi kedua kolom bertanda `*` (NIP opsional). Gerbang yang sama juga dipasang di `main_graph.route_from_map`, jadi jalur Streamlit pun tidak bisa memproduksi modul tanpa penyusun |
+| Pertanyaan soal struktur/gaya modul tak pernah menyitasi `template` | KB belum ter-ingest | `docker compose exec app python tools/rag_verify.py` → bila collection hilang: `python -m rag.kb` **lalu rebuild image** (index di-ship di dalam image) |
+| `[rag.kb] PERINGATAN: embedder index (...) != embedder aktif (...)` | `EMBEDDING_MODEL` sempat terisi lalu dikosongkan | ingest sengaja **dilewati** agar index 384-d tidak rusak; `python -m rag.kb --force` untuk rebuild |

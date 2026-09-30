@@ -28,7 +28,7 @@ from langgraph.types import Send
 from agents.agent1_syllabus import agent1_node
 from agents.agent2_content import agent2_node
 from agents.agent3_evaluator import agent3_node
-from agents.state import STATUS_FAIL, GlobalState, ModuleState
+from agents.state import STATUS_FAIL, GlobalState, ModuleState, penyusun_ok
 from tools.word_injector import inject_all_modules
 
 
@@ -70,9 +70,17 @@ def route_from_map(state: GlobalState):
     Guard ganda: tanpa modul atau tanpa approval manusia, tidak ada
     edge (graph berhenti dengan sopan - harusnya tak terjadi karena
     interrupt sudah mem-pause sebelum node ini).
+
+    Ronde 18: ditambah gerbang PENYUSUN. Ini gerbang kedua (yang pertama di
+    /api/approve) supaya jalur Streamlit app.py atau pemanggilan graph
+    langsung juga tidak bisa memproduksi modul tanpa nama penyusun.
     """
     modules = state.get("modules") or []
     if not modules or not state.get("approved_by_human"):
+        return []
+    if not penyusun_ok(modules):
+        print("[main_graph] DITOLAK: modul belum punya nama + profesi penyusun "
+              "(isi di gerbang approval /api/approve) - produksi tidak dijalankan.")
         return []
     return [Send("Agent2_Node", m) for m in modules]
 

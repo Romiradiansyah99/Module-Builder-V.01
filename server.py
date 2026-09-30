@@ -51,7 +51,7 @@ from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Stre
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from agents.state import ModuleState
+from agents.state import ModuleState, penyusun_missing
 from tools.ai_memory import start_background_update
 from tools.auth import (
     auth_configured,
@@ -70,6 +70,7 @@ from tools.llm_config import (
 from tools.session_store import load as load_sessions
 from tools.session_store import save as save_sessions
 from rag.threads import THREADS as RAG_THREADS
+from rag import config
 
 
 @asynccontextmanager
@@ -150,6 +151,9 @@ _graph = None
 _graph_lock = threading.Lock()
 _rag_ready = False
 _rag_error: Optional[str] = None
+# Ringkasan KB referensi (template + contoh modul) - diisi thread ingest,
+# dibaca /healthz & /api/info dari memori (tanpa query Chroma per request).
+_kb_status: Optional[dict] = None
 
 # Session demo: thread_id -> {"chat_messages": [...], "phase": str, "program": str}
 # Persisten (runtime/sessions.json via tools/session_store.py) - restart
@@ -193,13 +197,19 @@ def _ingest_background():
 
 
 def _ingest_rag_background(prior_thread=None):
-    """Auto-index program docx aktif utk RAG chat (best-effort).
+    """Auto-index program docx + KB referensi utk RAG chat (best-effort).
 
     `prior_thread` = thread ingest SKKNI. Ditunggu selesai dulu supaya tidak
     ada dua inisialisasi `PersistentClient` chromadb yang konkuren (chromadb
     1.5.9 race 'RustBindingsAPI') - tanpa ini thread SKKNI bisa crash saat
     boot dan `_wait_rag()` mem-503 semua endpoint module-builder chat.
+
+    Tahap KB sengaja dijalankan di THREAD YANG SAMA (bukan thread ketiga)
+    supaya tetap hanya ada satu yang menyentuh PersistentClient pada satu
+    waktu. `_rag_error` TIDAK PERNAH diisi dari sini, jadi kegagalan KB
+    tidak bisa mem-503 /api/chat - module-builder harus tetap hidup.
     """
+    global _kb_status
     if prior_thread is not None:
         prior_thread.join(timeout=120)
     try:
@@ -210,6 +220,37 @@ def _ingest_rag_background(prior_thread=None):
             print(f"[server] RAG chat siap (program: {rec.get('chunk_count', 0)} chunk).")
     except Exception as exc:  # noqa: BLE001 - jangan biarkan server mati
         print(f"[server] RAG chat ingest program GAGAL (diabaikan): {exc}")
+
+    # Tahap 2: KB referensi Kemnaker (template + contoh modul). Biasanya
+    # no-op cepat karena content_hash tidak berubah sejak index di-ship.
+    if not config.KB_INGEST_ON_BOOT:
+        return
+    try:
+        from rag.kb import ingest_kb, kb_status
+
+        rec = ingest_kb()
+        _kb_status = kb_status()
+        if _kb_status.get("error"):
+            print(f"[server] KB referensi error (diabaikan): {_kb_status['error']}")
+        else:
+            print(f"[server] KB referensi siap: {_kb_status.get('chunk_count', 0)} chunk "
+                  f"({_kb_status.get('doc_count', 0)} dokumen).")
+        # PERINGATAN PENTING: `database/chroma_db/` BUKAN volume (hanya
+        # ./runtime yang di-mount) - ia hidup di dalam image. Jadi bila boot
+        # ini benar-benar meng-embed sesuatu, hasilnya ditulis ke lapisan
+        # container yang akan HILANG saat kontainer di-recreate, dan indeks
+        # kembali ke versi yang di-bake di image. Tanpa peringatan ini,
+        # operator yang mengubah contoh modul lalu restart akan melihat
+        # perubahannya terindeks, lalu diam-diam hilang pada recreate
+        # berikutnya. Jadikan permanen dgn rebuild image.
+        if rec.get("embedded"):
+            print(f"[server] !! KB di-index ULANG saat boot ({rec['embedded']} dokumen) "
+                  "-> hanya bertahan di kontainer ini. Jalankan `python -m rag.kb` "
+                  "di build context lalu `docker compose build` agar permanen.",
+                  flush=True)
+    except Exception as exc:  # noqa: BLE001 - jangan biarkan server mati
+        _kb_status = {"ready": False, "error": f"{type(exc).__name__}: {exc}"}
+        print(f"[server] KB referensi GAGAL (diabaikan - chatbot tetap jalan): {exc}")
 
 
 def _wait_rag() -> None:
@@ -427,7 +468,8 @@ def api_login(req: LoginRequest):
 @app.get("/healthz")
 def healthz():
     """Healthcheck tanpa auth (dipakai Docker HEALTHCHECK / uptime monitor)."""
-    return {"ok": True, "rag_ready": _rag_ready, "rag_error": _rag_error}
+    return {"ok": True, "rag_ready": _rag_ready, "rag_error": _rag_error,
+            "kb": _kb_status}
 
 
 @app.get("/api/info")
@@ -442,6 +484,8 @@ def info():
         "template_exists": t["exists"],
         "rag_ready": _rag_ready,
         "rag_error": _rag_error,
+        # KB referensi (template + contoh modul): jumlah chunk & dokumen.
+        "kb": _kb_status,
         "output_dir": str(OUTPUT_DIR),
         "active_program": get_active_program(),
         # Transparansi biaya mode AUTO (ronde 3): token per tahap LLM.
@@ -651,8 +695,39 @@ def stop_stream(thread_id: str):
     return {"ok": True, "stopped": ev is not None}
 
 
+class PenyusunIn(BaseModel):
+    """Data penyusun dari gerbang approval (ronde 18).
+
+    Nama + jabatan/profesi WAJIB - modul tidak boleh diproduksi tanpa keduanya
+    (keluhan reviewer: "Harusnya diisi dulu, sblum dibuat, ini jadi gate").
+    NIP opsional; ditulis menyatu di sel profesi karena template tidak punya
+    kolom NIP.
+    """
+    nama: str = ""
+    profesi: str = ""
+    nip: str = ""
+    nama2: str = ""
+    profesi2: str = ""
+    nip2: str = ""
+
+    def to_penyusun(self) -> dict:
+        def _prof(profesi: str, nip: str) -> str:
+            profesi, nip = (profesi or "").strip(), (nip or "").strip()
+            if profesi and nip:
+                return f"{profesi}\nNIP. {nip}"
+            return profesi or (f"NIP. {nip}" if nip else "")
+
+        out = {
+            "nama": (self.nama or "").strip(),
+            "profesi": _prof(self.profesi, self.nip),
+            "nama2": (self.nama2 or "").strip(),
+            "profesi2": _prof(self.profesi2, self.nip2),
+        }
+        return out
+
+
 @app.post("/api/approve/{thread_id}")
-def approve(thread_id: str):
+def approve(thread_id: str, body: PenyusunIn = None):
     """HITL approve -> SSE stream event produksi paralel.
 
     Event (satu per baris, prefixed "data: "):
@@ -674,6 +749,27 @@ def approve(thread_id: str):
         raise HTTPException(404, "Thread tidak dikenal. Mulai percakapan baru.")
     if session["phase"] not in ("approval", "done"):
         raise HTTPException(409, f"Thread sedang phase '{session['phase']}'.")
+
+    # --- Gerbang PENYUSUN (ronde 18) ---
+    # Dicek SEBELUM semaphore & sebelum phase diubah, supaya penolakan tidak
+    # meninggalkan slot produksi terkunci. Reviewer: "Harusnya diisi dulu,
+    # sblum dibuat, ini jadi gate sblum mebiatan".
+    cfg = _config(thread_id)
+    graph = get_graph()
+    modules = list((graph.get_state(cfg).values or {}).get("modules") or [])
+    if not modules:
+        raise HTTPException(409, "Belum ada modul di thread ini. Susun silabus dulu.")
+    # Tanpa body (mis. panggilan lama): pakai data yang sudah tergali Agent 1.
+    penyusun = body.to_penyusun() if body is not None else dict(modules[0].get("penyusun") or {})
+    missing = penyusun_missing(penyusun)
+    if missing:
+        label = {"nama": "Nama penyusun", "profesi": "Jabatan/profesi penyusun"}
+        raise HTTPException(
+            400,
+            "Gerbang penyusun belum lengkap — "
+            + ", ".join(label.get(k, k) for k in missing)
+            + " wajib diisi sebelum modul diproduksi.",
+        )
     if not _PRODUCE_SEMAPHORE.acquire(blocking=False):
         limit = os.getenv("PRODUCE_CONCURRENCY", "2")
         raise HTTPException(
@@ -705,7 +801,13 @@ def approve(thread_id: str):
         ctx_token = set_context_program(session.get("program"))
         try:
             graph = get_graph()
-            graph.update_state(_config(thread_id), {"approved_by_human": True})
+            # Ronde 18: tulis penyusun + approval SEKALIGUS. Daftar modul
+            # dikirim LENGKAP (bukan modul parsial) karena reducer merge_modules
+            # MENGGANTI dict per module_id - modul parsial akan menghapus
+            # draft_json/syllabus_rows.
+            full_modules = [{**m, "penyusun": dict(penyusun)} for m in modules]
+            graph.update_state(_config(thread_id),
+                               {"modules": full_modules, "approved_by_human": True})
             for event in graph.stream(None, _config(thread_id), stream_mode="updates"):
                 for node, payload in event.items():
                     if node == "Map_Modules":

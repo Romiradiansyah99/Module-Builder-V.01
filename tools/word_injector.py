@@ -28,11 +28,13 @@ Ronde 11 (kesesuaian template + gambar wajib):
     kurang key dilengkapi string kosong agar render tak pernah Undefined.
 """
 
+import copy
 import os
 import re
 from pathlib import Path
 from typing import List, Optional
 
+from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.shared import Inches, Mm, Pt
 from docxtpl import DocxTemplate, InlineImage, Listing
@@ -131,27 +133,63 @@ def _fit_png(png: Optional[Path], max_w_mm: float,
 # 145x350mm/150x594mm pada output sebelumnya dikritik reviewer.
 _IMG_PENGETAHUAN_MAX = (135.0, 100.0)  # diagram flowchart pengetahuan
 _IMG_GAMBAR_KERJA_MAX = (120.0, 100.0)  # gambar kerja LIK
-_IMG_COVER_MAX = (120.0, 130.0)  # foto cover page (ronde 13)
-_COVER_Y_MM = 72.0  # jarak dari atas kertas: judul berakhir ~47mm, footer 268mm
+
+# Slot foto cover DI DALAM template (ronde 18). Bukan gambar yang disisipkan
+# kode - ia sudah ada di template sebagai anchor behindDoc 205.9x144.1 mm
+# (rasio 10:7), jadi byte-nya cukup DITUKAR. Lihat _apply_generated_cover().
+_COVER_ENTRY = "word/media/image3.jpg"
+
+
+def _image_mode(llm_mode: str) -> str:
+    """Kebijakan sumber gambar. SELALU salah satu dari "replicate" | "search".
+
+    Dari env IMAGE_MODE (ronde 18):
+    - "replicate" : Replicate dulu utk SETIAP gambar (permintaan user: "all
+      the image are all generated with replicate API"); pencarian internet
+      hanya jaring pengaman terakhir agar subbab tak kosong.
+    - "search"    : foto internet dulu, Replicate sbg fallback.
+    - "auto"      : perilaku ronde 13b - ikuti mode per-query dari Agent 2
+      (mode "generate" -> Replicate dulu, selain itu cari internet dulu).
+
+    Return HANYA dua nilai: pemanggil membandingkan dgn "replicate". Jangan
+    pernah mengembalikan "generate" - pemanggil lama membandingkan ke nilai
+    itu dan mode replicate akan diam-diam jadi "cari internet dulu" (bug
+    ronde 18: IMAGE_MODE=replicate tak berpengaruh sama sekali).
+    """
+    env = (os.getenv("IMAGE_MODE") or "auto").strip().lower()
+    if env in ("replicate", "search"):
+        return env
+    return "replicate" if str(llm_mode or "").strip() == "generate" else "search"
+
+
+def _subbab_images_enabled() -> bool:
+    """Kill switch gambar per SUB-SUBBAB (ronde 18, WS4).
+
+    Tiap gambar sub-subbab = satu panggilan Replicate berbayar, jadi biaya
+    produksi naik sebanding jumlah sub-subbab. Default AKTIF ("1"); set
+    IMAGE_SUBBAB_ENABLED=0 untuk kembali ke perilaku ronde 16 (satu gambar
+    per subbab elemen saja) tanpa mengubah kode.
+    """
+    return (os.getenv("IMAGE_SUBBAB_ENABLED", "1") or "1").strip().lower() \
+        not in ("0", "false", "no", "off")
 
 
 def _fetch_image_safe(query: str, out_path: Path, mode: str = "cari") -> Optional[Path]:
-    """Gambar utk query dengan mode pilihan Agent 2 (ronde 13b):
-    - "generate": AI Replicate (google/nano-banana-v2) dulu -> gagal: cari internet.
-    - "cari"    : foto nyata internet dulu -> gagal: fallback AI Replicate
-      (agar tiap subbab/cover dijamin punya gambar; Replicate dijalankan
-      hanya bila pencarian kosong).
+    """Gambar utk query. Urutan sumber ditentukan `_image_mode()` (IMAGE_MODE).
+
     Selalu return path atau None - kegagalan internet/API TIDAK boleh
-    menggagalkan injeksi Word."""
+    menggagalkan injeksi Word. Jaring pengaman terakhir dipertahankan
+    (ronde 16: "tiap subbab dijamin punya gambar")."""
     query = str(query or "").strip()
     if not query:
         return None
 
     def _generate() -> Optional[Path]:
         try:
-            from tools.image_gen import generate_image
+            from tools.image_gen import generate_image, subbab_output_format
 
-            png = generate_image(query, out_path)
+            png = generate_image(query, out_path,
+                                 output_format=subbab_output_format())
             if png:
                 return Path(png)
         except Exception as exc:  # noqa: BLE001
@@ -171,15 +209,35 @@ def _fetch_image_safe(query: str, out_path: Path, mode: str = "cari") -> Optiona
             print(f"[word_injector] Pencari gambar gagal ({exc}) - lewati")
         return None
 
-    if mode == "generate":
-        return _generate() or _search()
-    return _search() or _generate()
+    if _image_mode(mode) == "replicate":
+        got = _generate() or _search()
+    else:
+        got = _search() or _generate()
+    if got is None:
+        # Kedua sumber gagal -> slot gambar DIBIARKAN KOSONG (injeksi .docx
+        # tidak boleh gagal karena generator gambar). Jejaknya dulu tidak
+        # lengkap: log memuat "Replicate gagal ... - lewati" tetapi tidak
+        # pernah menyatakan bahwa subbabnya benar-benar terbit TANPA gambar,
+        # dan `image_search.fetch_image` yang pulang kosong tidak mencetak
+        # apa pun. Terukur pada smoke ronde 18: satu ReadTimeout + pencarian
+        # yang tak menemukan apa pun = subbab "1. Memeriksa dokumen
+        # pengiriman sampah" tampil tanpa gambar, tanpa satu baris pun yang
+        # menunjuk ke sana.
+        print(f"[word_injector] PERINGATAN: tidak ada gambar utk "
+              f"\"{query[:60]}\" (Replicate + pencarian gagal) - "
+              f"slot dibiarkan kosong")
+    return got
 
 
 def _normalize_image_queries(value) -> dict:
-    """draft_json["image_queries"] -> {"<no subbab>": {"query","judul"}}.
+    """draft_json["image_queries"] -> {"<no subbab/subbab>": {"query","judul"}}.
     Bentuk mentah dari LLM: list of {"subbab": "1", "query": "...",
-    "judul": "..."}. Entri rusak dibuang - sisanya tetap dipakai."""
+    "judul": "..."}. Entri rusak dibuang - sisanya tetap dipakai.
+
+    Ronde 18 (WS4): key boleh nomor SUB-SUBBAB ("1.1", "1.4") selain subbab
+    elemen ("1") - dipakai _maybe_photo untuk menyisipkan gambar alat/APD
+    tepat di bawah tiap sub-subbab pengetahuan (komentar reviewer id=7).
+    """
     out: dict = {}
     if not isinstance(value, list):
         return out
@@ -189,7 +247,10 @@ def _normalize_image_queries(value) -> dict:
         query = str(item.get("query") or "").strip()
         if not query:
             continue
-        num = re.sub(r"\.0$", "", str(item.get("subbab") or item.get("no") or "")).strip().rstrip(".")
+        raw = str(item.get("subbab") or item.get("no") or "").strip().rstrip(".")
+        # "1.0" (hasil konversi angka oleh LLM) -> "1"; "1.10" TIDAK ikut jadi
+        # "1.1" (dulu regex `\.0$` menggerusnya - tabrakan key).
+        num = re.sub(r"^(\d+)\.0$", r"\1", raw)
         if not num:
             continue
         out[num] = {
@@ -201,62 +262,288 @@ def _normalize_image_queries(value) -> dict:
     return out
 
 
-def _inline_to_anchor(inline, x_emu: int, y_emu: int, docpr_id: int):
-    """Ubah wp:inline (gambar inline) menjadi wp:anchor MELAYANG dengan
-    posisi absolut dari tepi kertas (ronde 13, foto cover page). Semua anak
-    extent/docPr/graphic dipindahkan utuh - r:id hub tetap valid."""
-    from lxml import etree
+def _rewrite_zip_entries(docx_path: Path, replacements: dict) -> bool:
+    """Tulis ulang .docx dengan ISI beberapa entry diganti; entry lain apa adanya.
 
+    Semua entry ditulis ulang dalam URUTAN ASLI dan memakai `zin.getinfo(name)`
+    sebagai ZipInfo sehingga date_time / compress_type / external_attr tiap
+    entry ikut terjaga, dan [Content_Types].xml tetap jadi entry pertama (tidak
+    pernah ditulis ulang, jadi tidak mungkin rusak).
+
+    `replacements` = {nama_entry: bytes_baru}; entry yang tidak ada di zip
+    dilewati (dicatat) tanpa menggagalkan sisanya.
+
+    Catatan: "apa adanya" berlaku utk ISI entry; stream deflate-nya
+    di-encode ulang oleh zipfile (Word tidak mempermasalahkan ini).
+    """
+    import zipfile
+
+    if not replacements:
+        return False
+    docx_path = Path(docx_path)
+    tmp = docx_path.with_name(docx_path.name + ".swap")
+    try:
+        with zipfile.ZipFile(docx_path) as zin:
+            names = zin.namelist()
+            missing = [e for e in replacements if e not in names]
+            if missing:
+                print(f"[word_injector] Entry tidak ada di {docx_path.name}: {missing}")
+            with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as zout:
+                for name in names:  # urutan asli - jangan di-sort
+                    info = zin.getinfo(name)
+                    zout.writestr(info, replacements.get(name) or zin.read(name))
+                zout.comment = zin.comment
+        os.replace(str(tmp), str(docx_path))
+        return True
+    except Exception as exc:  # noqa: BLE001 - gagal normalisasi != injeksi gagal
+        print(f"[word_injector] Tulis ulang entry gagal ({type(exc).__name__}: "
+              f"{str(exc)[:120]}) - dokumen dibiarkan apa adanya")
+        return False
+    finally:
+        if tmp.exists():
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+
+
+def _swap_zip_entry(docx_path: Path, entry: str, new_bytes: bytes) -> bool:
+    """Ganti isi SATU entry zip; seluruh entry lain disalin apa adanya.
+
+    Dipakai utk menukar foto cover template (ronde 18) - pembungkus tipis
+    _rewrite_zip_entries agar pemanggil lama tidak berubah.
+    """
+    return _rewrite_zip_entries(Path(docx_path), {entry: new_bytes})
+
+
+# ----------------------------------------------------------------------
+# Ronde 18 (WS3b): normalisasi pasca-render
+# ----------------------------------------------------------------------
+# Dua cacat yang HANYA lahir saat render (template tidak bisa memperbaikinya):
+#
+#  1. NUMBERING HILANG (komentar reviewer id=22 "Seharusnya ada numbering").
+#     docxtpl.Listing mengubah "\n" menjadi <w:br/> DI DALAM SATU paragraf
+#     (docxtpl/template.py: resolve_listing). Word hanya menomori baris
+#     pertama; sisanya tampak tanpa nomor. Perbaikan: pecah paragraf ber-numPr
+#     yang memuat <w:br/> menjadi N paragraf dengan pPr yang SAMA.
+#
+#  2. NUMBERING KEDOUBLE (id=44 "Numbering ny kedouble"). LLM kadang menulis
+#     "1. Melaksanakan tugas..." padahal paragrafnya sudah ber-numPr
+#     (lvlText "%1.") -> tampil "1. 1. ...". Perbaikan: buang prefiks ordinal
+#     dari run pertama paragraf ber-numPr. Deterministik, jadi tetap benar
+#     walau LLM membandel.
+#
+# Ditambah jaring pengaman warna: 00B0F0 -> 000000 kalau template suatu saat
+# dirombak lagi tanpa _normalize_colors.
+
+_ORDINAL_RE = re.compile(r"^\s*\d+[.)]\s+")
+_LINE_BREAK_TYPES = (None, "", "textWrapping")
+_BLUE = "00B0F0"
+
+
+def _is_line_break(br) -> bool:
+    """True hanya utk <w:br/> yang memindah baris - BUKAN page break.
+    Page break (w:type="page"/"column") harus dipertahankan apa adanya."""
+    return (br.get(qn("w:type")) or "").strip() in _LINE_BREAK_TYPES
+
+
+def _has_numpr(p) -> bool:
+    pPr = p.find(qn("w:pPr"))
+    return pPr is not None and pPr.find(qn("w:numPr")) is not None
+
+
+def _split_para_on_breaks(p) -> bool:
+    """Pecah satu <w:p> BER-numPr pada tiap <w:br/> menjadi paragraf terpisah
+    dengan pPr + rPr yang sama. Return True bila paragraf benar-benar dipecah.
+
+    Sengaja HANYA paragraf ber-numPr: <w:br/> di paragraf biasa (prosa) adalah
+    pemindahan baris yang disengaja dan tampilannya sudah benar - memecahnya
+    justru menambah jarak `w:after` dan mengubah perilaku keepNext/daftar isi.
+    """
+    if not _has_numpr(p):
+        return False
+    breaks = [br for br in p.findall(".//" + qn("w:br")) if _is_line_break(br)]
+    if not breaks:
+        return False
+
+    pPr = p.find(qn("w:pPr"))
+    segments = [[]]  # list[list[OxmlElement]] - isi tiap paragraf baru
+    for child in list(p):
+        if child is pPr:
+            continue
+        if child.tag != qn("w:r"):
+            segments[-1].append(child)  # elemen non-run: ikut segmen berjalan
+            continue
+        rPr = child.find(qn("w:rPr"))
+        parts = [[]]
+        for rc in list(child):
+            if rc is rPr:
+                continue
+            if rc.tag == qn("w:br") and _is_line_break(rc):
+                parts.append([])
+            else:
+                parts[-1].append(rc)
+        for i, part in enumerate(parts):
+            if i > 0:
+                segments.append([])
+            if not part:
+                continue  # segmen kosong (mis. dua <w:br/> berurutan)
+            new_run = OxmlElement("w:r")
+            if rPr is not None:
+                new_run.append(copy.deepcopy(rPr))  # rPr disalin ke TIAP bagian
+            for rc in part:
+                new_run.append(rc)  # node asli dipindah, bukan disalin
+            segments[-1].append(new_run)
+
+    if len(segments) <= 1:
+        return False  # hanya <w:br/> tanpa teks sesudahnya - tak ada yang dipecah
+
+    parent = p.getparent()
+    for seg in segments:
+        new_p = OxmlElement("w:p")
+        if pPr is not None:
+            new_p.append(copy.deepcopy(pPr))  # numPr ikut -> tiap baris bernomor
+        for el in seg:
+            new_p.append(el)
+        p.addprevious(new_p)
+    parent.remove(p)
+    return True
+
+
+def _strip_ordinal_prefix(p) -> bool:
+    """Buang prefiks ordinal ("1. " / "2) ") dari awal paragraf ber-numPr.
+
+    Prefiks TIDAK selalu berada di satu `w:t`: Agent 2/LLM menulisnya sebagai
+    run sendiri (`<w:t>1) </w:t><w:t>Pengetahuan tentang...</w:t>`), jadi teks
+    seluruh node `w:t` digabung dulu, panjang prefiks dihitung dari gabungan
+    itu, lalu dipotong dari node-node di depan secara berurutan. Node yang
+    habis terpotong jadi kosong - itu benar, karena nomornya kini dibuat Word.
+    """
+    if not _has_numpr(p):
+        return False
+    ts = list(p.findall(".//" + qn("w:t")))
+    joined = "".join(t.text or "" for t in ts)
+    if not joined.strip():
+        return False
+    m = _ORDINAL_RE.match(joined)
+    if m is None:
+        return False  # tidak ada prefiks ordinal -> tidak kedouble
+
+    drop = m.end()
+    for t in ts:
+        if drop <= 0:
+            break
+        txt = t.text or ""
+        if len(txt) <= drop:
+            drop -= len(txt)
+            t.text = ""
+        else:
+            t.text = txt[drop:]
+            drop = 0
+        t.set(qn("xml:space"), "preserve")
+    return True
+
+
+def _normalize_rendered_docx(docx_path: Path) -> bool:
+    """Perbaiki NUMBERING (hilang/kedouble) + sisa warna biru pada .docx hasil
+    render. Dijalankan pada file .tmp SEBELUM dipublikasikan, jadi pembaca
+    tidak pernah melihat versi setengah dinormalisasi."""
     from docx.oxml import parse_xml
 
-    def _xml(el):
-        return etree.tostring(el, encoding="unicode")
+    docx_path = Path(docx_path)
+    try:
+        import zipfile
 
-    extent = inline.find(qn("wp:extent"))
-    docpr = inline.find(qn("wp:docPr"))
-    frame = inline.find(qn("wp:cNvGraphicFramePr"))
-    graphic = inline.find(qn("a:graphic"))
-    docpr.set("id", str(docpr_id))
-    docpr.set("name", f"Cover Image {docpr_id}")
-    return parse_xml(
-        '<wp:anchor xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing" '
-        'distT="0" distB="0" distL="114300" distR="114300" simplePos="0" '
-        'relativeHeight="251658240" behindDoc="0" locked="0" layoutInCell="1" allowOverlap="1">'
-        '<wp:simplePos x="0" y="0"/>'
-        f'<wp:positionH relativeFrom="page"><wp:posOffset>{x_emu}</wp:posOffset></wp:positionH>'
-        f'<wp:positionV relativeFrom="page"><wp:posOffset>{y_emu}</wp:posOffset></wp:positionV>'
-        + _xml(extent)
-        + '<wp:effectExtent l="0" t="0" r="0" b="0"/><wp:wrapNone/>'
-        + _xml(docpr)
-        + (_xml(frame) if frame is not None else "")
-        + _xml(graphic)
-        + "</wp:anchor>"
-    )
+        with zipfile.ZipFile(docx_path) as z:
+            doc_xml = z.read("word/document.xml")
+            try:
+                num_xml = z.read("word/numbering.xml")
+            except KeyError:
+                num_xml = None
+    except Exception as exc:  # noqa: BLE001
+        print(f"[word_injector] Normalisasi dilewati ({type(exc).__name__}: {exc})")
+        return False
+
+    root = parse_xml(doc_xml)
+    split_n = strip_n = 0
+    # DUA fase: pecah dulu SEMUA paragraf ber-<w:br/> (daftar yang di-Listing),
+    # baru sapu prefiks ordinal di SELURUH pohon termasuk paragraf hasil
+    # pemecahan. Satu fase tidak cukup: paragraf yang dipecah dilewati, dan
+    # justru di situ ordinal kedouble paling sering muncul ("1. Menerima
+    # instruksi kerja<w:br/>2. Mencatat ..." -> dua nomor palsu).
+    for p in list(root.iter(qn("w:p"))):
+        if _split_para_on_breaks(p):
+            split_n += 1
+    for p in list(root.iter(qn("w:p"))):
+        if _strip_ordinal_prefix(p):
+            strip_n += 1
+
+    num_root = parse_xml(num_xml) if num_xml else None
+    blue_n = 0
+    for root_el in (root, num_root):
+        if root_el is None:
+            continue
+        for color_el in root_el.findall(".//" + qn("w:color")):
+            if (color_el.get(qn("w:val")) or "").upper() == _BLUE:
+                color_el.set(qn("w:val"), "000000")
+                blue_n += 1
+
+    replacements = {"word/document.xml": _serialize_xml(root)}
+    if num_root is not None:
+        replacements["word/numbering.xml"] = _serialize_xml(num_root)
+    ok = _rewrite_zip_entries(docx_path, replacements)
+    if ok:
+        print(f"[word_injector] Normalisasi: {split_n} paragraf dipecah (numbering "
+              f"per baris), {strip_n} prefiks ordinal dibuang, {blue_n} warna biru "
+              f"-> hitam")
+    return ok
 
 
-def _add_cover_image(doc, img_path: Path) -> None:
-    """Sisipkan foto ke COVER PAGE (ronde 13, komentar reviewer: cover harus
-    ada gambar relevan dengan judul). Sebagai ANCHOR melayang posisi absolut
-    (relativeFrom=page) - tidak menggeser aliran teks cover yang dibangun
-    textbox melayang (judul di y=4-47mm, footer y=268mm)."""
-    from PIL import Image
+def _serialize_xml(root) -> bytes:
+    """Serialisasi elemen OOXML kembali menjadi bytes UTF-8 + deklarasi XML."""
+    from lxml import etree
 
-    with Image.open(str(img_path)) as im:
-        aspect = im.width / max(im.height, 1)
-    max_w, max_h = _IMG_COVER_MAX
-    w_mm = min(max_w, max_h * aspect)
-    h_mm = w_mm / max(aspect, 0.01)
-    para = doc.paragraphs[0]  # paragraf pertama = section cover
-    run = para.add_run()
-    run.add_picture(str(img_path), width=Mm(w_mm), height=Mm(h_mm))
-    drawing = run._r.find(qn("w:drawing"))
-    inline = drawing.find(qn("wp:inline"))
-    ids = [int(el.get("id")) for el in doc.element.body.iter(qn("wp:docPr"))]
-    new_id = (max(ids) + 1) if ids else 901
-    x_emu = int(((210.0 - w_mm) / 2.0) * 36000)  # tengah kertas A4
-    y_emu = int(_COVER_Y_MM * 36000)
-    drawing.replace(inline, _inline_to_anchor(inline, x_emu, y_emu, new_id))
-    print(f"[word_injector] Foto cover disisipkan ({w_mm:.0f}x{h_mm:.0f}mm)")
+    return etree.tostring(root, xml_declaration=True, encoding="UTF-8",
+                          standalone=True)
+
+
+def _apply_generated_cover(docx_path: Path, draft_json: dict,
+                           module_title: str) -> bool:
+    """Ganti foto cover template dengan ilustrasi hasil Replicate (ronde 18).
+
+    Slot cover template = `word/media/image3.jpg` (1400x980 px, rasio 10:7),
+    dirujuk PERSIS SATU KALI sebagai anchor behindDoc 205.9x144.1 mm di
+    belakang textbox judul. Karena byte-nya ditukar (bukan ditambah gambar
+    baru), tata letak resmi Kemnaker - judul, kode unit, footer - tidak
+    bergeser sedikit pun, dan gambar dijamin terlihat (sblmnya overlay
+    pernah menutupi gambar template dan ditolak reviewer).
+
+    Return True bila cover berhasil diganti. Semua kegagalan (token kosong,
+    kredit habis, Word sedang membuka file) -> False: cover template tetap
+    dipakai, dokumen tetap tersimpan.
+    """
+    if (os.getenv("IMAGE_COVER_MODE", "replicate") or "").strip().lower() != "replicate":
+        return False
+
+    query = str((draft_json or {}).get("cover_image_query") or "").strip() or \
+        str(module_title or "").strip()
+    if not query:
+        return False
+
+    try:
+        from tools.image_gen import generate_cover
+
+        tmp_jpg = Path(docx_path).parent / "_mermaid" / "cover.jpg"
+        jpg = generate_cover(query, tmp_jpg)
+        if jpg is None:
+            print("[word_injector] Cover Replicate tidak tersedia - pakai foto template")
+            return False
+        if _swap_zip_entry(Path(docx_path), _COVER_ENTRY, Path(jpg).read_bytes()):
+            print(f"[word_injector] Cover diganti ilustrasi Replicate: {query[:60]}")
+            return True
+    except Exception as exc:  # noqa: BLE001 - jangan gagalkan injeksi Word
+        print(f"[word_injector] Cover generate gagal ({type(exc).__name__}) - lewat")
+    return False
 
 
 def _canonical_subbab(syllabus_rows) -> tuple:
@@ -296,6 +583,7 @@ def _build_pengetahuan_subdoc(tpl: DocxTemplate, text: str, tmp_dir: Path,
     tmp_dir.mkdir(parents=True, exist_ok=True)
     pos = 0
     img_i = 0  # SATU urutan "Gambar N." utk diagram + foto (ronde 13)
+    seen_queries: set = set()  # query yang sudah dipakai -> tidak dobel gambar
 
     def _add_caption(judul: str) -> None:
         from docx.enum.text import WD_ALIGN_PARAGRAPH
@@ -324,28 +612,47 @@ def _build_pengetahuan_subdoc(tpl: DocxTemplate, text: str, tmp_dir: Path,
         return True
 
     def _maybe_photo(heading: str) -> None:
-        """Foto/ilustrasi ter-center tepat di bawah judul subbab (komentar
-        reviewer ronde 13: "masih ga ada gambar" - diagram saja tidak cukup;
-        ronde 16: tiap subbab DIJAMIN punya gambar, rata-tengah, ukuran
-        konsisten). Counter "Gambar N." hanya naik saat foto BENAR-BENAR
-        terpasang - kalau tidak, caption mermaid mulai dari "Gambar 2." tanpa
-        "Gambar 1." (bug terukur pada smoke ronde 13)."""
+        """Foto/ilustrasi ter-center tepat di bawah judul subbab/subbab.
+
+        Komentar reviewer ronde 13: "masih ga ada gambar" - diagram saja tidak
+        cukup. Ronde 16: tiap SUBBAB dijamin punya gambar, rata-tengah, ukuran
+        konsisten. Ronde 18 (WS4, komentar reviewer id=7 "lebih banyak gambar
+        yang menjelaskan keperluan atau alat kerja, seperti APD, alat tulis,
+        kertas, contoh instruksi kerja"): gambar juga disisipkan per
+        SUB-SUBBAB pengetahuan, memakai entri `image_queries` ber-key "1.1".
+
+        Query sub-subbab yang tidak punya entri eksplisit memakai judul
+        sub-subbab itu sendiri (bukan entri induknya) - supaya foto induk
+        tidak muncul dua kali berturut-turut, karena subbabnya sudah dapat
+        foto sendiri. Matikan lewat IMAGE_SUBBAB_ENABLED=0.
+
+        Counter "Gambar N." hanya naik saat foto BENAR-BENAR terpasang - kalau
+        tidak, caption mermaid mulai dari "Gambar 2." tanpa "Gambar 1." (bug
+        terukur pada smoke ronde 13).
+        """
         nonlocal img_i
-        m = re.match(r"^(\d+)\.\s", heading or "")
+        m = re.match(r"^(\d+(?:\.\d+)*)\.?\s", heading or "")
         if not m:
             return
-        subbab_no = m.group(1)
-        spec = (photo_queries or {}).get(subbab_no)
-        # Ronde 16 ketersediaan: subbab tanpa entri query tetap wajib punya
-        # gambar -> fallback query dari judul subbab itu sendiri.
+        key = m.group(1)
+        is_subsub = "." in key
+        if is_subsub and not _subbab_images_enabled():
+            return
+        spec = (photo_queries or {}).get(key)
+        # Subbab tanpa entri query tetap wajib punya gambar (ronde 16); untuk
+        # sub-subbab, judulnya sendiri jadi query.
         query = (spec or {}).get("query") or _strip_heading(heading)
         if not query:
             return
+        norm_q = re.sub(r"\s+", " ", query.strip().lower())
+        if norm_q in seen_queries:
+            return  # query kembar -> jangan tempel foto yang sama dua kali
         png = _fetch_image_safe(
-            query, tmp_dir / f"foto_{subbab_no}.png",
+            query, tmp_dir / f"foto_{key.replace('.', '_')}.png",
             mode=str((spec or {}).get("mode") or "cari"),
         )
         if png is not None:
+            seen_queries.add(norm_q)
             img_i += 1
             judul = ((spec or {}).get("judul") or (spec or {}).get("query")
                      or _strip_heading(heading) or "Gambar kerja")
@@ -548,12 +855,17 @@ def inject_module(module: ModuleState, output_dir: Path = None) -> Path:
 
     tpl.render(context)
 
-    # Ronde 17 (reviewer): GAMBAR COVER TIDAK diganti - pakai GAMBAR ASLI dari
-    # template "word Kemenaker lama" (tertanam di section cover sebagai anchor
-    # di belakang textbox judul). Sblmnya foto internet (cover_image_query) di-
-    # fetch lalu di-overlay di atasnya, menutupi gambar template; kini biarkan
-    # gambar cover template tampil apa adanya. (cover_image_query di draft tidak
-    # lagi dipakai; query gambar tetap berfungsi utk SUBBAB via image_queries.)
+    # --- Cover page (ronde 18) ---
+    # Ronde 17 memakai FOTO ASLI template apa adanya (overlay foto internet
+    # DITOLAK reviewer krn menutupi gambar template). Ronde 18 memenuhi
+    # permintaan user "cover page ... generated with replicate API" tanpa
+    # mengulang kesalahan itu: byte `word/media/image3.jpg` DI DALAM template
+    # ditukar dgn ilustrasi Replicate - slot, posisi, ukuran (205.9x144.1 mm),
+    # dan tata letak textbox judul tidak berubah sama sekali, jadi gambar
+    # dijamin terlihat utk SEMUA teks (judul berada di atas gambar, bukan
+    # menimpanya). _apply_generated_cover() mengembalikan False (cover
+    # template dipertahankan) bila Replicate mati/token kosong.
+    module_title = str(module.get("module_title") or context.get("module_title") or "")
 
     # --- Simpan hasil (atomik) ---
     filename = f'{module.get("module_id", "M?")}_{_slugify(module.get("module_title", "modul"))}.docx'
@@ -564,11 +876,19 @@ def inject_module(module: ModuleState, output_dir: Path = None) -> Path:
     # fallback simpan langsung agar demo/tes lokal tetap jalan.
     tmp_path = out_path.with_suffix(".docx.tmp")
     tpl.save(str(tmp_path))
+    # Normalisasi pasca-render (WS3b) DI DALAM .tmp dulu: numbering per baris,
+    # prefiks ordinal dibuang, sisa warna biru -> hitam.
+    _normalize_rendered_docx(tmp_path)
+    # Tukar cover DI DALAM .tmp dulu (bukan di out_path) supaya pembaca
+    # tidak pernah melihat zip setengah tertulis; baru lalu dipublikasikan.
+    _apply_generated_cover(tmp_path, draft_json, module_title)
     try:
         os.replace(str(tmp_path), str(out_path))
     except PermissionError:
         os.unlink(str(tmp_path))
         tpl.save(str(out_path))
+        _normalize_rendered_docx(out_path)
+        _apply_generated_cover(out_path, draft_json, module_title)
         print(f"[word_injector] Replace atomik terblokir (file terbuka?) - simpan langsung: {out_path}")
     print(f"[word_injector] Saved: {out_path}")
     return out_path
@@ -636,6 +956,14 @@ if __name__ == "__main__":
                  "keterampilan": "Mengidentifikasi alat", "durasi": "1 JP"},
             ],
             "bahan_rows": [{"no": "1", "nama": "Kertas HVS", "spek": "A4 80gsm", "jumlah": "10 lembar"}],
+            # Ronde 18 (WS3b): daftar bernomor + prefiks ordinal manual -
+            # latihan untuk normalisasi pasca-render (numbering per baris +
+            # prefiks ordinal dibuang).
+            "lik_peralatan": "Helm keselamatan\nSepatu keselamatan\nSarung tangan",
+            "lik_langkah_kerja": "1. Menyiapkan alat kerja\n2. Melaksanakan pekerjaan",
+            "evaluasi_pengetahuan": ("1) Pengetahuan tentang jenis alat\n"
+                                     "2) Pengetahuan tentang fungsi alat"),
+            "evaluasi_praktik": "1) Mengidentifikasi alat",
             "kamus_rows": [{"no": "a.", "istilah": "Kondenser", "arti": "Komponen pendingin"}],
             "referensi_rows": [{"no": "a.", "url": "https://kbbi.co.id"}],
         },
