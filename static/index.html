@@ -669,6 +669,11 @@ function applyChatResponse(j, placeholder, fromTid){
     placeholder.innerHTML = renderMarkdown(j.reply);
     if (!document.contains(placeholder)) $("chat-log").appendChild(placeholder);
     if (j.modules && j.modules.length){
+      /* Ronde 21: peringatan gerbang penyusun sebagai BALON CHAT, di atas
+         kartu - reviewer memintanya eksplisit ("kasih tau peringatan by chat
+         klo mau produksi harus ngisi dulu nama dan pekerjaan"). Teks datang
+         dari server (satu sumber), dan hanya ada bila masih kosong. */
+      if (j.notice) addMsg("bot", j.notice);
       renderApprovalCard(j.modules);   // item 2: selalu tampilkan draf TERBARU
       log(`Silabus siap: ${j.modules.length} modul — menunggu approval`);
     } else {
@@ -963,6 +968,12 @@ function approvePenyusun(){
   if (!body.profesi) kurang.push("Jabatan / profesi");
   if (kurang.length){
     if (err){ err.hidden = false; err.textContent = "Wajib diisi sebelum produksi: " + kurang.join(", ") + "."; }
+    /* Ronde 21: umpan balik juga lewat chat, bukan hanya tulisan kecil di
+       dalam kartu - permintaan reviewer: "kasih tau peringatan by chat klo
+       misal mau produksi itu harus ngisi dulu nama dan pekerjaan". */
+    addMsg("bot", "⚠️ **Modul belum bisa diproduksi** — " + kurang.join(" dan ")
+      + " belum diisi. Isi dulu pada kartu *Draft silabus*, lalu klik **Setujui & Produksi** lagi. "
+      + "Keduanya tercetak di halaman *Daftar Nama Penyusun* modul.");
     return null;
   }
   if (err){ err.hidden = true; err.textContent = ""; }
@@ -993,6 +1004,11 @@ async function approve(){
       if (String(msg).includes("penyusun")){
         const err = $("py-err");
         if (err){ err.hidden = false; err.textContent = msg; }
+        // Ronde 21: gerbang ditolak server (mis. nilai terisi hanya spasi,
+        // atau kartu yang dipakai bukan kartu aktif) -> kabari juga di chat.
+        addMsg("bot", "⚠️ **Modul belum bisa diproduksi** — " + msg
+          + " Isi **Nama penyusun** dan **Jabatan / profesi** pada kartu *Draft silabus*, "
+          + "lalu klik **Setujui & Produksi** lagi.");
         return;
       }
       if (String(msg).includes("phase")){
@@ -1102,6 +1118,7 @@ async function openThread(tid){
     $("hero").style.display = msgs.length ? "none" : "";
     for (const m of msgs) addMsg(m.role === "user" ? "user" : "bot", m.content);
     if (j.phase === "approval" && j.modules && j.modules.length){
+      if (j.notice) addMsg("bot", j.notice);   // ronde 21: peringatan penyusun
       renderApprovalCard(j.modules);
     } else if (j.phase === "done"){
       done = true;

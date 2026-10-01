@@ -337,6 +337,8 @@ class ChatResponse(BaseModel):
     program_name: str
     modules: list
     reply: str
+    # Ronde 21: peringatan gerbang penyusun sebagai balon chat ("" bila lengkap).
+    notice: str = ""
 
 
 # Status manusiawi per tahap LLM (ronde 4) - dikirim ke UI selama menunggu.
@@ -430,6 +432,9 @@ def _finalize_chat(thread_id: str, values: dict) -> dict:
         "program_name": values.get("program_name", ""),
         "modules": modules,
         "reply": reply,
+        # Ronde 21: silabus siap + penyusun belum lengkap -> UI menampilkan
+        # peringatan di chat (bukan hanya di dalam kartu, yang mudah terlewat).
+        "notice": penyusun_notice(modules) if phase == "approval" else "",
     }
 
 
@@ -726,6 +731,34 @@ class PenyusunIn(BaseModel):
         return out
 
 
+_PENYUSUN_LABEL = {"nama": "**Nama penyusun**", "profesi": "**Jabatan / profesi**"}
+
+
+def penyusun_notice(modules) -> str:
+    """Peringatan gerbang penyusun untuk ditampilkan sebagai BALON CHAT.
+
+    Dikirim sebagai field `notice` pada respons chat & /api/state, BUKAN
+    disisipkan ke `chat_messages`: riwayat percakapan itulah yang dibaca Agent 1
+    pada giliran berikutnya, dan peringatan ini urusan gerbang/UI - bukan isi
+    pembicaraan. Karena tidak disimpan, ia otomatis hilang begitu nama +
+    jabatan terisi (dihitung ulang tiap respons), dan tetap muncul kembali
+    saat halaman dimuat ulang selama masih kosong.
+
+    Return "" bila penyusun sudah lengkap - pemanggil cukup `if notice:`.
+    """
+    first = (list(modules or []) + [{}])[0]
+    missing = penyusun_missing(first.get("penyusun") or {})
+    if not missing:
+        return ""
+    kurang = ", ".join(_PENYUSUN_LABEL.get(k, k) for k in missing)
+    return (
+        f"⚠️ **Sebelum produksi** — {kurang} belum diisi. Isi dulu pada kartu "
+        "*Draft silabus* di bawah, lalu klik **Setujui & Produksi**. Tombolnya "
+        "tidak akan berjalan selama keduanya kosong, karena keduanya tercetak "
+        "di halaman *Daftar Nama Penyusun* modul."
+    )
+
+
 @app.post("/api/approve/{thread_id}")
 def approve(thread_id: str, body: PenyusunIn = None):
     """HITL approve -> SSE stream event produksi paralel.
@@ -904,6 +937,10 @@ def _slim(module) -> dict:
         "kode_unit": m.get("kode_unit", ""),
         "alokasi_waktu": m.get("alokasi_waktu", ""),
         "syllabus_rows": m.get("syllabus_rows") or [],
+        # Ronde 21: ikut dikirim agar kartu approval terisi-awal setelah
+        # halaman dimuat ulang (sebelumnya field penyusun selalu kosong lagi,
+        # walau Agent 1 sudah menggali nama dari percakapan).
+        "penyusun": m.get("penyusun") or {},
         "status_evaluasi": m.get("status_evaluasi", ""),
         "iteration_count": m.get("iteration_count", 0),
         "evaluator_feedback": (m.get("evaluator_feedback") or "")[:500],
@@ -943,13 +980,16 @@ def state(thread_id: str):
         raise HTTPException(404, "Thread tidak dikenal.")
     snapshot = get_graph().get_state(_config(thread_id))
     values = snapshot.values or {}
+    modules = values.get("modules") or []
     return {
         "thread_id": thread_id,
         "phase": session["phase"],
         "program_name": values.get("program_name", ""),
-        "modules": [_slim(m) for m in values.get("modules") or []],
+        "modules": [_slim(m) for m in modules],
         "documents": values.get("final_documents") or [],
         "chat_messages": session["chat_messages"],
+        # Ronde 21: agar peringatan penyusun tetap tampil setelah muat ulang.
+        "notice": penyusun_notice(modules) if session["phase"] == "approval" else "",
     }
 
 

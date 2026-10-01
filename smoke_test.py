@@ -468,7 +468,8 @@ def t_gates_and_normalize():
     _saved_sessions, _saved_graph = dict(_srv.SESSIONS), _srv.get_graph
     try:
         _srv.SESSIONS.clear()
-        _srv.SESSIONS["smoke-t"] = {"phase": "approval", "thread_id": "smoke-t"}
+        _srv.SESSIONS["smoke-t"] = {"phase": "approval", "thread_id": "smoke-t",
+                                    "chat_messages": [{"role": "user", "content": "halo"}]}
         _srv.get_graph = lambda: _FakeGraph()
         _cli = TestClient(_srv.app, raise_server_exceptions=False)
         # Di deployment (VPS), auth AKTIF dan middleware app-level menolak
@@ -490,6 +491,28 @@ def t_gates_and_normalize():
                          json={"nama": "  ", "profesi": "Instruktur"}).status_code == 400
         _p = _srv.PenyusunIn(nama="Romi Putra", profesi="Instruktur", nip="19690725")
         assert _p.to_penyusun()["profesi"] == "Instruktur\nNIP. 19690725", _p.to_penyusun()
+
+        # Ronde 21: peringatan gerbang penyusun lewat CHAT, bukan hanya di dalam
+        # kartu. Sumbernya satu (server, field `notice`) supaya teks UI dan
+        # server tidak bisa berbeda; ia dihitung ulang tiap respons (jadi
+        # hilang sendiri saat terisi) dan TIDAK disimpan di chat_messages -
+        # riwayat itulah yang dibaca Agent 1 giliran berikutnya.
+        assert "Nama penyusun" in _srv.penyusun_notice([{"penyusun": {}}])
+        _half = _srv.penyusun_notice([{"penyusun": {"nama": "Romi", "profesi": ""}}])
+        assert "Jabatan / profesi" in _half and "Nama penyusun" not in _half, _half
+        assert _srv.penyusun_notice(
+            [{"penyusun": {"nama": "Romi", "profesi": "Instruktur"}}]) == ""
+        assert _srv.penyusun_notice([]) != "", "tanpa modul pun belum ada penyusun"
+
+        _st = _cli.get("/api/state/smoke-t")
+        assert _st.status_code == 200, _st.status_code
+        _j = _st.json()
+        assert "Sebelum produksi" in _j.get("notice", ""), _j.get("notice")
+        assert _j["modules"][0]["penyusun"] == {}, \
+            "kartu approval butuh penyusun ikut dikirim agar terisi-awal"
+        _msgs = _srv.SESSIONS["smoke-t"]["chat_messages"]
+        assert len(_msgs) == 1 and "produksi" not in _msgs[0]["content"].lower(), \
+            f"peringatan TIDAK boleh masuk riwayat percakapan: {_msgs}"
     finally:
         _srv.SESSIONS.clear()
         _srv.SESSIONS.update(_saved_sessions)

@@ -38,17 +38,18 @@ The current frontend is a single-file, no-build-step SPA (`static/index.html`). 
 | `GET /api/info` | — | template tags, RAG readiness, active program path, `llm_usage`, `ai_memory` (learned style rules) |
 | `GET /api/units` | — | `{"program_title", "units": [{no, kelompok, judul, kode, jumlah, alokasi}]}` — for suggestion chips |
 | `POST /api/program/upload` | multipart `file` (.docx) | `{"program_title", "units", "units_available", "file", "active_program"}` — replaces active program; accepts drafts (no unit table) too |
-| `POST /api/chat` | `{"thread_id"?, "message"}` | **non-stream fallback**: `ChatResponse {thread_id, phase, program_name, modules, reply}` |
+| `POST /api/chat` | `{"thread_id"?, "message"}` | **non-stream fallback**: `ChatResponse {thread_id, phase, program_name, modules, reply, notice}` |
 | `POST /api/chat/stream` | `{"thread_id"?, "message"}` | **SSE** (see §4) — primary chat endpoint |
 | `POST /api/stop/{thread_id}` | — | `{"ok", "stopped"}` — cancels a running chat stream server-side (idempotent) |
-| `POST /api/approve/{thread_id}` | — | **SSE** (see §5) — starts production |
+| `POST /api/approve/{thread_id}` | `{"nama", "profesi", "nip"?, "nama2"?, "profesi2"?, "nip2"?}` | **SSE** (see §5) — starts production. **400** if `nama` or `profesi` is empty (author gate) |
 | `GET /api/threads` | — | `{"threads": [{thread_id, title, phase, n_messages, updated}]}` — sidebar history |
-| `GET /api/state/{thread_id}` | — | full snapshot: `{thread_id, phase, program_name, modules[], documents[], chat_messages[]}` — used to restore a thread |
+| `GET /api/state/{thread_id}` | — | full snapshot: `{thread_id, phase, program_name, modules[], documents[], chat_messages[], notice}` — used to restore a thread |
 | `GET /api/download/{filename}` | — | the generated `.docx` (Content-Disposition attachment) |
 
-- `ChatResponse.modules` is a list of **slim modules**: `{module_id, module_title, kode_unit, alokasi_waktu, syllabus_rows[], status_evaluasi, iteration_count, evaluator_feedback, draft_filled, draft_preview}`.
+- `ChatResponse.modules` is a list of **slim modules**: `{module_id, module_title, kode_unit, alokasi_waktu, syllabus_rows[], penyusun{}, status_evaluasi, iteration_count, evaluator_feedback, draft_filled, draft_preview}`.
 - `syllabus_rows` is the Word-style syllabus table; each row: `{elemen_no?, elemen, kuk_no, kuk, indikator, pengetahuan, keterampilan, durasi}`. Render with **rowspan grouping on `elemen`** (column format mirrors the official Kemnaker syllabus table).
 - `phase == "approval"` (modules present) → show the approval card with the syllabus table(s), a **Revise** path (just send a new chat message) and an **Approve** button (`POST /api/approve/{thread_id}`).
+- `notice` (round 21) is a **non-empty warning string only while the author gate is incomplete** (`{}` → both `nama` and `profesi` are missing). Show it **as a chat bubble above the approval card** and again when an approve attempt is rejected — the card's inline hint alone is easy to miss. It is computed per response, never stored in `chat_messages`, so it disappears by itself once the fields are filled. `modules[].penyusun` is sent as well so the card's inputs can be **pre-filled** (e.g. after a page reload or when Agent 1 already dug the name out of the conversation); `profesi` may carry a second line `NIP. …`.
 
 ## 4. SSE — `POST /api/chat/stream`
 
