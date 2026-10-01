@@ -16,6 +16,8 @@ Langkah yang dites:
  8b. Unit: parser, reducer, routing revisi
  8c. (--full) Auto-effort + dig percakapan LLM (ronde 3)
  9. Demo inject docxtpl (tanpa LLM)
+ 9b. Gerbang penyusun (HTTP 400) + normalisasi docx (ronde 18)
+ 9c. /api/approve jalur bahagia - regresi UnboundLocalError (ronde 20)
 10. (--full) Agent 3 structured output + mini pipeline 1 modul
 """
 
@@ -541,7 +543,88 @@ def t_gates_and_normalize():
     print("      Gerbang penyusun (grafik + HTTP 400) & invarian docx: OK")
 
 
+def t_approve_http_ok():
+    """Jalur BAHAGIA /api/approve - bukan hanya jalur penolakan 400.
+
+    Bug produksi (VPS, 2026-10-01): di dalam `worker()` nama `modules` pernah
+    ditugasi di loop, sehingga `modules` menjadi LOKAL untuk seluruh fungsi
+    dan baris `full_modules = [{**m, ...} for m in modules]` - yang membaca
+    `modules` milik closure `approve` - melempar `UnboundLocalError: cannot
+    access local variable 'modules' where it is not associated with a value`.
+    Akibatnya SSE membalas {"type":"error",...} dan SETIAP approve di
+    dashboard gagal, sementara langkah 9b tetap HIJAU: uji 9b hanya menempuh
+    jalur penolakan 400, yang berhenti sebelum worker menyala. Uji ini
+    menempuh jalur sebaliknya (grafik palsu, tanpa LLM/gambar).
+    """
+    from fastapi.testclient import TestClient
+
+    import server as _srv
+    from tools.auth import auth_configured, make_session_token
+
+    # Bentuk modul nyata: yang penting ada field yang HANYA ada di state
+    # lengkap (draft_json/syllabus_rows). Reducer merge_modules MENGGANTI dict
+    # per module_id, jadi modul parsial akan menghapusnya - uji ini sekaligus
+    # menjaga bahwa daftar modul dikirim UTUH, bukan potongan.
+    _module = {"module_id": "M01", "module_title": "Uji",
+               "draft_json": {"tujuan": ["a"]}, "syllabus_rows": [{"no": "1"}],
+               "penyusun": {}}
+
+    class _Snap:
+        def __init__(self, values):
+            self.values = values
+
+    class _FakeGraph:
+        def __init__(self):
+            self.updated = {}
+
+        def get_state(self, cfg):
+            return _Snap({"modules": [dict(_module)]})
+
+        def update_state(self, cfg, values):
+            self.updated = values
+
+        def stream(self, inp, cfg, stream_mode=None):
+            # bentuk nyata stream_mode="updates": {nama_node: delta_state}
+            yield {"Agent2_Node": {"modules": [{"module_id": "M01",
+                                                "module_title": "Uji"}]}}
+            yield {"Word_Node": {"final_documents": ["output/M01_Uji.docx"]}}
+
+    _graph = _FakeGraph()
+    _saved = (dict(_srv.SESSIONS), _srv.get_graph, _srv.save_sessions)
+    try:
+        _srv.SESSIONS.clear()
+        _srv.SESSIONS["smoke-9c"] = {"phase": "approval", "program": None}
+        _srv.get_graph = lambda: _graph
+        # worker memanggil save_sessions(SESSIONS); jangan sentuh
+        # runtime/sessions.json milik laptop ini.
+        _srv.save_sessions = lambda *a, **k: None
+        _cli = TestClient(_srv.app, raise_server_exceptions=False)
+        if auth_configured():  # VPS: middleware auth menolak 401 lebih dulu
+            _cli.cookies.set("kb_session", make_session_token())
+
+        _r = _cli.post("/api/approve/smoke-9c",
+                       json={"nama": "Romi Putra", "profesi": "Instruktur",
+                             "nip": "19690725"})
+        _body = _r.text
+        assert _r.status_code == 200, (_r.status_code, _body[:400])
+        assert '"type": "done"' in _body, f"stream tidak selesai: {_body[:400]}"
+        assert '"type": "error"' not in _body, f"approve gagal: {_body[:400]}"
+        assert '"type": "documents"' in _body, f"dokumen tidak dilaporkan: {_body[:400]}"
+        assert _graph.updated.get("approved_by_human") is True, _graph.updated
+        _mods = _graph.updated.get("modules") or []
+        assert len(_mods) == 1, _mods
+        assert _mods[0]["penyusun"]["profesi"] == "Instruktur\nNIP. 19690725", _mods[0]
+        assert _mods[0]["draft_json"] == {"tujuan": ["a"]} and _mods[0]["syllabus_rows"], \
+            "modul parsial menghapus draft_json/syllabus_rows di reducer merge_modules"
+    finally:
+        _sessions, _srv.get_graph, _srv.save_sessions = _saved
+        _srv.SESSIONS.clear()
+        _srv.SESSIONS.update(_sessions)
+    print("      /api/approve jalur bahagia (penyusun tertulis, modul utuh): OK")
+
+
 step("9b. Gerbang penyusun + normalisasi docx (ronde 18)", t_gates_and_normalize)
+step("9c. /api/approve jalur bahagia - regresi UnboundLocalError 'modules' (ronde 20)", t_approve_http_ok)
 
 
 # --- 10. FULL: Agent 3 structured output + mini pipeline -------------------

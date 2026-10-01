@@ -812,9 +812,16 @@ def approve(thread_id: str, body: PenyusunIn = None):
                 for node, payload in event.items():
                     if node == "Map_Modules":
                         continue
-                    modules = (payload or {}).get("modules")
-                    if modules:
-                        for m in modules:
+                    # JANGAN beri nama `modules`: itu variabel closure dari
+                    # `approve` yang dibaca tepat di atas (full_modules). Satu
+                    # penugasan lokal membuat `modules` jadi LOKAL worker, dan
+                    # baris `full_modules = [... for m in modules]` melempar
+                    # UnboundLocalError -> SETIAP approve di dashboard gagal
+                    # ("cannot access local variable 'modules'"). Terukur di
+                    # produksi VPS 2026-10-01; uji 9c menjaga regresinya.
+                    node_modules = (payload or {}).get("modules")
+                    if node_modules:
+                        for m in node_modules:
                             q.put(("module", {"node": node, "module": _slim(m)}))
                             # Narasi nyata per tahap node (ronde 6 poin 5).
                             if node == "Agent2_Node":
