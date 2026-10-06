@@ -46,18 +46,26 @@ for _stream in (sys.stdout, sys.stderr):
     except Exception:  # noqa: BLE001 - stream non-reconfigurable diabaikan
         pass
 
-from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile
+from fastapi import Depends, FastAPI, File, HTTPException, Request, Response, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from agents.state import ModuleState, penyusun_missing
-from tools.ai_memory import start_background_update
+from tools.ai_memory import set_context_owner, start_background_update
 from tools.auth import (
+    COOKIE_NAME,
+    DEV_OWNER,
     auth_configured,
     check_password,
+    clear_session_cookie_kwargs,
     cookie_kwargs,
+    current_owner,
+    make_owner_token,
     make_session_token,
+    new_owner_id,
+    owner_cookie_kwargs,
+    resolve_owner_for_login,
     verify_session_token,
 )
 from tools.doc_utils import OUTPUT_DIR, get_active_program, set_context_program, template_info
@@ -97,19 +105,45 @@ async def lifespan(_app: FastAPI):
 _PUBLIC_PATHS = {"/login", "/api/login", "/healthz"}
 
 
-def require_auth(request: Request):
+def require_auth(request: Request, response: Response):
+    """Gerbang login + penetapan identitas privat per-browser (kb_owner).
+
+    Id pemilik disimpan di request.state.owner agar handler bisa memfilter
+    riwayat percakapan. Tanpa konfigurasi auth (dev lokal) semua permintaan
+    memakai DEV_OWNER sehingga pengembangan lokal tetap jalan.
+    """
     if not auth_configured():
+        request.state.owner = DEV_OWNER  # dev lokal: satu identitas tetap
         return  # mode dev lokal tanpa konfigurasi auth
     path = request.url.path
     if path in _PUBLIC_PATHS:
         return
-    if verify_session_token(request.cookies.get("kb_session")):
+    if verify_session_token(request.cookies.get(COOKIE_NAME)):
+        owner = current_owner(request)
+        if not owner:
+            # Browser yang sudah login SEBELUM fitur ini belum punya kb_owner.
+            # Terbitkan sekarang; FastAPI menggabungkan cookie dari dependency
+            # ke respons akhir untuk endpoint yang mengembalikan dict/JSON.
+            owner = new_owner_id()
+            response.set_cookie(value=make_owner_token(owner), **owner_cookie_kwargs())
+        request.state.owner = owner
         return
     if path.startswith("/api/"):
         raise HTTPException(401, "Belum login. Muat ulang halaman untuk login.")
     # Dependency app-level membuang nilai balikan, tapi EXCEPTION selalu
     # diteruskan: 303 + Location = browser mengikuti ke /login.
     raise HTTPException(status_code=303, headers={"Location": "/login"}, detail="Login diperlukan.")
+
+
+def _owner(request: Request) -> Optional[str]:
+    """Id pemilik pemanggil (diset require_auth). None bila tak diketahui."""
+    return getattr(request.state, "owner", None)
+
+
+def _owns(sess: Optional[dict], owner: Optional[str]) -> bool:
+    """True bila sesi ini milik pemilik tsb. Gagal-tertutup: owner None
+    (sesi era riwayat bersama) tidak cocok dengan siapa pun."""
+    return bool(sess) and owner is not None and sess.get("owner") == owner
 
 
 app = FastAPI(
@@ -160,6 +194,14 @@ _kb_status: Optional[dict] = None
 # server tidak membuang sesi tim lagi. Checkpoint graph juga persisten
 # (SqliteSaver, runtime/checkpoints.sqlite).
 SESSIONS: Dict[str, dict] = load_sessions()
+
+# Sesi era riwayat bersama (owner None) - kebijakan berbeda per mode:
+#   produksi: biarkan None -> tak terlihat siapa pun (gagal-tertutup)
+#   dev lokal: adopsi DEV_OWNER supaya riwayat lama tetap bisa diuji
+if not auth_configured():
+    for _sess in SESSIONS.values():
+        if _sess.get("owner") is None:
+            _sess["owner"] = DEV_OWNER
 
 
 def get_graph():
@@ -275,7 +317,15 @@ def _config(thread_id: str):
 _CANCELLED: Dict[str, threading.Event] = {}
 
 # RAG chat: event per thread (analog _CANCELLED, tapi rute /api/rag/stop).
+# Kunci di-namespace per pemilik: thread_id RAG datang dari KLIEN (bukan
+# uuid acak), jadi tanpa namespace dua orang yang memakai id sama akan
+# saling membatalkan stream.
 _RAG_CANCELLED: Dict[str, threading.Event] = {}
+
+
+def _rag_key(thread_id: str, owner: Optional[str]) -> str:
+    """Kunci cancel-map RAG: gabungan pemilik + thread_id."""
+    return f"{owner or ''}\x1f{thread_id}"
 
 
 # ----------------------------------------------------------------------
@@ -317,7 +367,12 @@ def _invoke_agent1(thread_id: str, chat_messages: list, continuing: bool = False
     # user lain tidak terkontaminasi upload satu user. ContextVar mewarisi
     # ke thread fan-out Agent2/3; threading.local tidak. Reset di finally
     # karena thread pool AnyIO dipakai ulang antar request.
-    token = set_context_program((SESSIONS.get(thread_id) or {}).get("program"))
+    sess = SESSIONS.get(thread_id) or {}
+    token = set_context_program(sess.get("program"))
+    # Identitas pemilik ikut di-cap: get_style_block() dipanggil TANPA argumen
+    # di dalam Agent 1 (agents/agent1_syllabus.py), jadi ContextVar inilah
+    # yang membuat memori sikap terbaca per-pemilik.
+    owner_token = set_context_owner(sess.get("owner"))
     try:
         graph.invoke(payload, _config(thread_id))
         snapshot = graph.get_state(_config(thread_id))
@@ -329,6 +384,7 @@ def _invoke_agent1(thread_id: str, chat_messages: list, continuing: bool = False
         return values
     finally:
         set_context_program(None)
+        set_context_owner(None)
 
 
 class ChatResponse(BaseModel):
@@ -350,8 +406,11 @@ STATUS_LABELS = {
 }
 
 
-def _prepare_chat(req: ChatRequest) -> Tuple[str, list, bool, dict]:
+def _prepare_chat(req: ChatRequest, owner: Optional[str]) -> Tuple[str, list, bool, dict]:
     """Logika sesi/thread bersama utk /api/chat dan /api/chat/stream.
+
+    owner = identitas pemanggil; thread baru dicap dengannya dan thread lama
+    milik orang lain ditolak 404 (bukan 403 - hindari oracle keberadaan).
 
     Return (thread_id, seed, continuing, session)."""
     message = req.message.strip()
@@ -360,6 +419,9 @@ def _prepare_chat(req: ChatRequest) -> Tuple[str, list, bool, dict]:
 
     old_thread = req.thread_id if req.thread_id in SESSIONS else None
     session = SESSIONS.get(old_thread) if old_thread else None
+    if session is not None and not _owns(session, owner):
+        # Id nyata milik pemilik lain: samarkan sebagai tidak ditemukan.
+        raise HTTPException(404, "Thread tidak dikenal.")
 
     # Ronde 9: timestamp utk daftar riwayat chat di sidebar (/api/threads).
     def _touch(s: dict, new: bool = False) -> None:
@@ -377,6 +439,8 @@ def _prepare_chat(req: ChatRequest) -> Tuple[str, list, bool, dict]:
             "phase": "chat",
             # Program mengikuti sesi lama (bukan global terakhir yang berubah)
             "program": session.get("program") or get_active_program(),
+            # Pemilik diwarisi dari sesi lama - revisi tetap milik orang yang sama.
+            "owner": session.get("owner") or owner,
         }
         _touch(SESSIONS[thread_id], new=True)
         seed = list(SESSIONS[thread_id]["chat_messages"])
@@ -395,6 +459,7 @@ def _prepare_chat(req: ChatRequest) -> Tuple[str, list, bool, dict]:
         _touch(session)
         if "program" not in session:  # sesi lama pra-upgrade: cap sekarang
             session["program"] = get_active_program()
+        session.setdefault("owner", owner)  # sabuk pengaman sesi lama
     else:
         thread_id = str(uuid.uuid4())
         SESSIONS[thread_id] = {
@@ -406,6 +471,8 @@ def _prepare_chat(req: ChatRequest) -> Tuple[str, list, bool, dict]:
             # Dicap saat thread dibuat: upload diikuti thread baru (frontend
             # me-reset thread_id saat upload), jadi program sesi = aktif kini.
             "program": get_active_program(),
+            # Identitas pemilik: inilah yang membuat riwayat privat per-browser.
+            "owner": owner,
         }
         _touch(SESSIONS[thread_id], new=True)
         seed = [{"role": "user", "content": message}]
@@ -457,8 +524,12 @@ class LoginRequest(BaseModel):
 
 
 @app.post("/api/login")
-def api_login(req: LoginRequest):
-    """Cek sandi -> cookie sesi ditandatangani (HttpOnly, 30 hari)."""
+def api_login(req: LoginRequest, request: Request):
+    """Cek sandi -> cookie sesi ditandatangani (HttpOnly, 30 hari).
+
+    Identitas (kb_owner) dipakai ULANG bila browser ini sudah punya, sehingga
+    riwayat percakapan kembali setelah login lagi di perangkat yang sama.
+    """
     if not auth_configured():
         raise HTTPException(
             400, "Auth belum dikonfigurasi (isi APP_PASSWORD_SHA256 & SESSION_SECRET di .env)."
@@ -467,6 +538,20 @@ def api_login(req: LoginRequest):
         raise HTTPException(401, "Kata sandi salah.")
     resp = JSONResponse({"ok": True})
     resp.set_cookie(value=make_session_token(), **cookie_kwargs())
+    # Kunci "riwayat kembali": identitas lama dipakai ulang, bukan dibuat baru.
+    resp.set_cookie(value=make_owner_token(resolve_owner_for_login(request)),
+                    **owner_cookie_kwargs())
+    return resp
+
+
+@app.post("/api/logout")
+def api_logout():
+    """Keluar dari sesi login - TAPI pertahankan identitas (kb_owner).
+
+    kb_owner sengaja tidak dihapus: itulah yang membuat riwayat percakapan
+    muncul kembali saat login lagi di browser yang sama."""
+    resp = JSONResponse({"ok": True})
+    resp.delete_cookie(**clear_session_cookie_kwargs())
     return resp
 
 
@@ -478,7 +563,7 @@ def healthz():
 
 
 @app.get("/api/info")
-def info():
+def info(request: Request):
     t = template_info()
     from tools.ai_memory import load as load_ai_memory
     from tools.doc_utils import get_active_program
@@ -496,7 +581,8 @@ def info():
         # Transparansi biaya mode AUTO (ronde 3): token per tahap LLM.
         "llm_usage": get_llm_usage(),
         # Ronde 5: aturan sikap yang dipelajari dari sesi-sesi sebelumnya.
-        "ai_memory": load_ai_memory(),
+        # Dipersempit ke pemanggil - dulu satu file global (bocor ke tim).
+        "ai_memory": load_ai_memory(_owner(request)),
     }
 
 
@@ -567,22 +653,24 @@ async def program_upload(file: UploadFile = File(...)):
 
 
 @app.post("/api/chat", response_model=ChatResponse)
-def chat(req: ChatRequest):
+def chat(req: ChatRequest, request: Request):
     """Versi non-stream (fallback bila SSE gagal di jaringan/proxy)."""
     _wait_rag()
-    thread_id, seed, continuing, _session = _prepare_chat(req)
+    thread_id, seed, continuing, _session = _prepare_chat(req, _owner(request))
     try:
         values = _invoke_agent1(thread_id, seed, continuing=continuing)
     except Exception as exc:  # noqa: BLE001 - laporkan sebagai 500 bermakna
         raise HTTPException(500, f"Agent 1 gagal: {exc}")
     response = _finalize_chat(thread_id, values)
     # Ronde 5: rangkum percakapan -> ilmu sikap (background, tak memblokir).
-    start_background_update(SESSIONS[thread_id]["chat_messages"])
+    # Owner diteruskan eksplisit: contextvars TIDAK menyeberang ke Thread baru.
+    start_background_update(SESSIONS[thread_id]["chat_messages"],
+                            owner=SESSIONS[thread_id].get("owner"))
     return ChatResponse(**response)
 
 
 @app.post("/api/chat/stream")
-def chat_stream(req: ChatRequest):
+def chat_stream(req: ChatRequest, request: Request):
     """Chat streaming SSE (ronde 4) - interaksi terasa langsung, bukan
     menggantung sampai LLM selesai penuh.
 
@@ -599,7 +687,7 @@ def chat_stream(req: ChatRequest):
     delta JSON/thinking difilter ReplyRelay sehingga user hanya melihat teks
     balasan. Graph tetap tidak diubah sama sekali."""
     _wait_rag()
-    thread_id, seed, continuing, _session = _prepare_chat(req)
+    thread_id, seed, continuing, _session = _prepare_chat(req, _owner(request))
 
     # Ronde 14: event Stop per thread - di-clear di awal agar stream ulang
     # pada thread yang sama tidak mewarisi cancel sebelumnya.
@@ -633,7 +721,9 @@ def chat_stream(req: ChatRequest):
             response = _finalize_chat(thread_id, values)
             q.put(("final", response))
             # Ronde 5: rangkum percakapan -> ilmu sikap (background).
-            start_background_update(SESSIONS[thread_id]["chat_messages"])
+            # Owner eksplisit: worker ini Thread baru, contextvars tak menyeberang.
+            start_background_update(SESSIONS[thread_id]["chat_messages"],
+                                    owner=SESSIONS[thread_id].get("owner"))
         except GenerationCancelled:
             # Ronde 14: pesan user yang dibatalkan tetap diserahkan ke state
             # graph (reducer chat_history) - tanpa ini pesan hilang dari
@@ -687,13 +777,16 @@ def chat_stream(req: ChatRequest):
 
 
 @app.post("/api/stop/{thread_id}")
-def stop_stream(thread_id: str):
+def stop_stream(thread_id: str, request: Request):
     """Ronde 14: hentikan streaming percakapan yang sedang berjalan.
 
     Meng-set event cancel yang dicek per baris oleh loop streaming LLM
     (llm_config._raw_chat_stream) -> panggilan naik sebagai
     GenerationCancelled (menembus fallback/retry agent). Idempoten: thread
     tanpa stream berjalan tetap OK (worker sudah selesai / belum ada)."""
+    # Kepemilikan: jangan biarkan satu orang membatalkan stream orang lain.
+    if not _owns(SESSIONS.get(thread_id), _owner(request)):
+        raise HTTPException(404, "Thread tidak dikenal.")
     ev = _CANCELLED.get(thread_id)
     if ev is not None:
         ev.set()
@@ -760,7 +853,7 @@ def penyusun_notice(modules) -> str:
 
 
 @app.post("/api/approve/{thread_id}")
-def approve(thread_id: str, body: PenyusunIn = None):
+def approve(thread_id: str, request: Request, body: PenyusunIn = None):
     """HITL approve -> SSE stream event produksi paralel.
 
     Event (satu per baris, prefixed "data: "):
@@ -778,7 +871,10 @@ def approve(thread_id: str, body: PenyusunIn = None):
     muncul di output streaming (ProductionRelay), dan dokumen yang tersimpan.
     """
     session = SESSIONS.get(thread_id)
-    if not session:
+    # Kepemilikan WAJIB dicek paling awal - sebelum gerbang penyusun dan
+    # sebelum semaphore: penolakan tidak boleh mengunci slot produksi
+    # (dan 404 menyamarkan keberadaan thread orang lain).
+    if not _owns(session, _owner(request)):
         raise HTTPException(404, "Thread tidak dikenal. Mulai percakapan baru.")
     if session["phase"] not in ("approval", "done"):
         raise HTTPException(409, f"Thread sedang phase '{session['phase']}'.")
@@ -832,6 +928,7 @@ def approve(thread_id: str, body: PenyusunIn = None):
         # Program per-sesi juga untuk fase produksi (Agent1 revisi tak dijalankan
         # di sini, tapi konsistensi context tetap dijaga lintas thread).
         ctx_token = set_context_program(session.get("program"))
+        set_context_owner(session.get("owner"))
         try:
             graph = get_graph()
             # Ronde 18: tulis penyusun + approval SEKALIGUS. Daftar modul
@@ -889,6 +986,7 @@ def approve(thread_id: str, body: PenyusunIn = None):
             q.put(("error", str(exc)))
         finally:
             set_context_program(None)
+            set_context_owner(None)
             _PRODUCE_SEMAPHORE.release()
             set_stream_sink(None)
             set_status_hook(None)
@@ -950,13 +1048,17 @@ def _slim(module) -> dict:
 
 
 @app.get("/api/threads")
-def threads():
+def threads(request: Request):
     """Ronde 9: daftar riwayat percakapan utk sidebar.
 
-    Judul = pesan user pertama (dipotong 64 char). Semua sesi muncul -
-    chat baru TIDAK menghapus yang lama (sesi server persisten)."""
+    Judul = pesan user pertama (dipotong 64 char). Hanya sesi MILIK pemanggil
+    yang muncul - inilah yang membuat sidebar privat per-browser; klien tidak
+    perlu berubah sama sekali."""
+    owner = _owner(request)
     items = []
     for tid, sess in SESSIONS.items():
+        if not _owns(sess, owner):
+            continue
         msgs = sess.get("chat_messages") or []
         first_user = next((m["content"] for m in msgs if m.get("role") == "user"), "")
         title = " ".join(first_user.split())
@@ -974,9 +1076,9 @@ def threads():
 
 
 @app.get("/api/state/{thread_id}")
-def state(thread_id: str):
+def state(thread_id: str, request: Request):
     session = SESSIONS.get(thread_id)
-    if not session:
+    if not _owns(session, _owner(request)):
         raise HTTPException(404, "Thread tidak dikenal.")
     snapshot = get_graph().get_state(_config(thread_id))
     values = snapshot.values or {}
@@ -994,7 +1096,7 @@ def state(thread_id: str):
 
 
 @app.get("/api/download/{filename}")
-def download(filename: str):
+def download(filename: str, request: Request):
     # Dokumen kini di output/<thread_id>/ (isolasi per-thread) - cari rekursif.
     if "/" in filename or "\\" in filename or ".." in filename:
         raise HTTPException(404, "File tidak ditemukan.")
@@ -1003,6 +1105,13 @@ def download(filename: str):
         raise HTTPException(404, "File tidak ditemukan.")
     path = matches[0].resolve()
     if OUTPUT_DIR.resolve() not in path.parents:
+        raise HTTPException(404, "File tidak ditemukan.")
+    # Isolasi per-thread: bila file berada di dalam folder thread yang dikenali,
+    # hanya pemiliknya yang boleh mengunduh. File di luar folder thread mana pun
+    # (artefak lama yang sengaja dipertahankan) tetap boleh diunduh.
+    parent_name = path.parent.name
+    parent_sess = SESSIONS.get(parent_name)
+    if parent_sess is not None and not _owns(parent_sess, _owner(request)):
         raise HTTPException(404, "File tidak ditemukan.")
     return FileResponse(
         path,
@@ -1079,16 +1188,16 @@ def rag_delete(doc_id: str):
 
 
 @app.post("/api/rag/stop/{thread_id}")
-def rag_stop_stream(thread_id: str):
+def rag_stop_stream(thread_id: str, request: Request):
     """Hentikan streaming jawaban RAG chat yang berjalan (idempoten)."""
-    ev = _RAG_CANCELLED.get(thread_id)
+    ev = _RAG_CANCELLED.get(_rag_key(thread_id, _owner(request)))
     if ev is not None:
         ev.set()
     return {"ok": True, "stopped": ev is not None}
 
 
 @app.post("/api/rag/chat/stream")
-def rag_chat_stream(req: RagChatRequest):
+def rag_chat_stream(req: RagChatRequest, request: Request):
     """SSE tanya-jawab atas dokumen (Rewrite-Retrieve-Read + streaming).
 
     Event (satu per baris, prefixed "data: "):
@@ -1106,8 +1215,10 @@ def rag_chat_stream(req: RagChatRequest):
     if not message:
         raise HTTPException(400, "Pesan kosong.")
     thread_id = req.thread_id or str(uuid.uuid4())
+    owner = _owner(request)
 
-    cancel_ev = _RAG_CANCELLED.setdefault(thread_id, threading.Event())
+    rag_key = _rag_key(thread_id, owner)
+    cancel_ev = _RAG_CANCELLED.setdefault(rag_key, threading.Event())
     cancel_ev.clear()
 
     q: queue.Queue = queue.Queue()
@@ -1128,6 +1239,7 @@ def rag_chat_stream(req: RagChatRequest):
                 token_cb=lambda delta: q.put(("token", delta)),
                 sources_cb=lambda docs: q.put(("sources", docs)),
                 context_strategy=req.context_strategy,
+                owner=owner,
             )
             q.put(("final", result))
         except GenerationCancelled:
@@ -1136,7 +1248,7 @@ def rag_chat_stream(req: RagChatRequest):
             q.put(("error", f"RAG chat gagal: {exc}"))
         finally:
             set_cancel_event(None)
-            _RAG_CANCELLED.pop(thread_id, None)
+            _RAG_CANCELLED.pop(rag_key, None)
 
     threading.Thread(target=worker, daemon=True).start()
 

@@ -128,6 +128,13 @@ a:hover{text-decoration:underline; text-underline-offset:2px}
   font-size:11.5px; cursor:pointer; padding:4px 2px; transition:color .15s;
 }
 #btn-log:hover{color:var(--text)}
+/* Keluar: hanya menghapus sesi login, identitas riwayat tetap (riwayat kembali). */
+#btn-logout{
+  margin-top:8px; width:100%; text-align:left; background:none; border:0; color:var(--muted);
+  font-size:11.5px; cursor:pointer; padding:4px 2px; transition:color .15s;
+  border-top:1px solid var(--side-border); padding-top:8px;
+}
+#btn-logout:hover{color:var(--text)}
 #log{display:none; font-family:ui-monospace,"SF Mono",Consolas,monospace; font-size:10.5px; color:var(--muted); max-height:140px; overflow-y:auto; margin-top:4px; white-space:pre-wrap}
 #log.show{display:block}
 
@@ -361,6 +368,7 @@ table.syl td.durasi{white-space:nowrap; color:var(--muted); width:7%}
     <div class="sb-bottom">
       <button id="btn-log" onclick="$('log').classList.toggle('show'); event.stopPropagation()">Log detail ▾</button>
       <div id="log"></div>
+      <button id="btn-logout" onclick="logout()" title="Keluar dari sesi ini">Keluar →</button>
     </div>
   </aside>
   <!-- Ronde 21: lapisan gelap di belakang drawer (hanya di layar kecil) -->
@@ -1127,6 +1135,14 @@ async function loadThreads(){
     renderThreads();
   } catch (err){ /* server belum siap - biarkan list lama */ }
 }
+async function logout(){
+  // Hanya sesi login yang dihapus; identitas riwayat (cookie kb_owner) sengaja
+  // dipertahankan server, jadi riwayat muncul lagi begitu login ulang di
+  // browser yang sama. Kegagalan (mis. sesi sudah kedaluwarsa) tetap lanjut.
+  try{ await fetch(API + "/api/logout", { method: "POST" }); }catch(err){ /* tetap keluar */ }
+  sessionStorage.removeItem("thread_id");
+  location.href = "/login";
+}
 function renderThreads(){
   const wrap = $("thread-list");
   if (!threadItems.length){ wrap.innerHTML = '<div class="sb-empty">Belum ada percakapan tersimpan.</div>'; return; }
@@ -1140,7 +1156,11 @@ async function openThread(tid){
   // Ronde 9b: BOLEH pindah thread kapan pun — chat yang sedang berjalan
   // tetap selesai di latar belakang; balasannya masuk ke daftar Riwayat.
   try{
-    const j = await (await fetch(`${API}/api/state/${tid}`)).json();
+    const res = await fetch(`${API}/api/state/${tid}`);
+    // 404 = thread milik orang lain / sudah dibersihkan. Perlakukan sebagai
+    // entri basi (bukan galat jaringan) agar hilang dari daftar Riwayat.
+    if (!res.ok) throw new Error(res.status === 404 ? "Thread tidak dikenal." : `HTTP ${res.status}`);
+    const j = await res.json();
     threadId = tid; sessionStorage.setItem("thread_id", tid);
     approvalModules = []; done = false;
     $("chat-log").innerHTML = "";
@@ -1164,8 +1184,11 @@ async function openThread(tid){
     if (window.innerWidth <= 820) setSidebar(false);
     $("chat-text").focus();
   } catch (err){
-    // thread tidak dikenal (server baru / sesi dibersihkan): buang dari tab ini
-    if (tid === threadId){ sessionStorage.removeItem("thread_id"); threadId = null; renderThreads(); }
+    // thread tidak dikenal (server baru / sesi dibersihkan / bukan milik kita):
+    // buang dari tab ini + dari daftar Riwayat supaya tidak jadi entri mati.
+    threadItems = threadItems.filter((t) => t.thread_id !== tid);
+    if (tid === threadId){ sessionStorage.removeItem("thread_id"); threadId = null; }
+    renderThreads();
     log("Gagal membuka percakapan: " + err.message);
   }
 }

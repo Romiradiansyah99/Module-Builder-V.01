@@ -11,6 +11,8 @@ runtime/
 output/
 database/uploads/
 database/ai_memory.json
+# Memori sikap per-pemilik (satu file per identitas browser)
+database/ai_memory/
 *.log
 
 # Index vector RAG dibangun ulang otomatis saat server pertama jalan

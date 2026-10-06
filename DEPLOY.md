@@ -260,18 +260,32 @@ tunnel service — keduanya independen.
 
 Semua state yang selamat restart ada di `/opt/kemnaker/runtime/`:
 `uploads/`, `output/<thread_id>/*.docx`, `checkpoints.sqlite`,
-`sessions.json`, `ai_memory.json`, `home/.cache/chroma/` (cache ONNX).
+`sessions.json`, `ai_memory/<owner>.json`, `home/.cache/chroma/` (cache ONNX).
 
-## 7. Perilaku yang disepakati (dengan kata sandi tunggal)
+## 7. Perilaku yang disepakati (privat per-browser)
 
-- Siapa pun yang login bisa membuka thread URL dan mengunduh output siapa
-  pun (satu sandi = satu ruang kerja tim).
-- `ai_memory.json` (aturan sikap AI) dan statistik `llm_usage` bersifat
-  organisasi — dipakai bersama semua anggota.
+- **Riwayat percakapan privat per-perangkat.** Satu sandi tim untuk masuk,
+  tetapi setiap browser punya **identitas sendiri** (`kb_owner` — cookie
+  bertanda tangan, HttpOnly, ~400 hari). Sidebar hanya menampilkan thread
+  milik browser itu; thread orang lain menjawab **404** (bukan 403) supaya
+  keberadaannya tidak bisa ditebak.
+- **Keluar bukan menghapus.** Tombol "Keluar →" hanya menghapus sesi login
+  (`kb_session`). Identitas (`kb_owner`) sengaja dipertahankan, sehingga
+  **login lagi di browser yang sama memunculkan kembali riwayat**. Berganti
+  perangkat / mode privat = identitas baru = riwayat kosong.
+- **`ai_memory` per-pemilik**: aturan sikap disimpan di
+  `runtime/ai_memory/<owner>.json`, jadi kebiasaan satu orang tidak bocor ke
+  rekan setim. Statistik `llm_usage` tetap organisasi (dipakai bersama).
+- **Masih bersama tim** (memang tidak diprivatkan): daftar unit
+  (`/api/units`), dokumen RAG (`/api/rag/docs`) beserta upload/hapusnya,
+  program aktif default (`active_program`), dan `llm_usage` di `/api/info`.
 - Maksimal **2 produksi paralel** (`PRODUCE_CONCURRENCY`); permintaan ke-3
   menerima pesan "coba lagi beberapa saat".
 - **Jangan pernah** menaikkan `--workers` di atas 1 — SqliteSaver tidak
   multi-process safe (checkpoint korup, modul dobel).
+- **Jangan pernah** merotasi `SESSION_SECRET`: itu mengeluarkan semua orang
+  sekaligus dan **mengorbitkan setiap identitas** (riwayat semua browser
+  mendadak tak terlihat, walau filenya masih ada).
 - File sesi & checkpoint hilang hanya jika volume `./runtime/` dihapus.
 
 ## 8. Pemecahan masalah cepat

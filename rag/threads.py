@@ -4,27 +4,40 @@ THREADS - riwayat percakapan RAG chat (in-memory per thread).
 Terpisah dari `SESSIONS` server (yang punya semantik fase pipeline modul).
 Cukup daftar [{role, content}] tanpa fase. Restart server membersihkannya;
 dianggap wajar (referensi rag-chatbot juga in-memory).
+
+Riwayat di-namespace per PEMILIK: thread_id RAG datang dari klien, jadi dua
+orang bisa memakai id yang sama. Tanpa namespace, transkrip satu orang bocor
+ke prompt orang lain. `owner=None` mereproduksi perilaku lama (satu ruang).
 """
 
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 from rag import config
 
-# thread_id -> [{role, content}, ...]  (role: "user" | "assistant")
+# kunci (owner, thread_id) -> [{role, content}, ...]  (role: "user" | "assistant")
 THREADS: Dict[str, List[Dict[str, str]]] = {}
 
 
-def append_user(thread_id: str, message: str) -> None:
-    THREADS.setdefault(thread_id, []).append({"role": "user", "content": message})
+def _key(thread_id: str, owner: Optional[str] = None) -> str:
+    """Kunci riwayat: pemilik + thread_id (pemisah tak mungkin muncul di id)."""
+    return f"{owner or ''}\x1f{thread_id}"
 
 
-def append_assistant(thread_id: str, answer: str) -> None:
-    THREADS.setdefault(thread_id, []).append({"role": "assistant", "content": answer})
+def append_user(thread_id: str, message: str, owner: Optional[str] = None) -> None:
+    THREADS.setdefault(_key(thread_id, owner), []).append(
+        {"role": "user", "content": message}
+    )
 
 
-def clamp(thread_id: str) -> List[Dict[str, str]]:
+def append_assistant(thread_id: str, answer: str, owner: Optional[str] = None) -> None:
+    THREADS.setdefault(_key(thread_id, owner), []).append(
+        {"role": "assistant", "content": answer}
+    )
+
+
+def clamp(thread_id: str, owner: Optional[str] = None) -> List[Dict[str, str]]:
     """Ambli riwayat dengan klip: max TURNS (percakapan) & CHARS total."""
-    history = THREADS.get(thread_id) or []
+    history = THREADS.get(_key(thread_id, owner)) or []
     max_messages = max(2, config.HISTORY_MAX_TURNS * 2)
     history = history[-max_messages:]
     # klip karakter dari atas: buang pasangan teratas sampai muat budget
@@ -40,9 +53,9 @@ def _chars(msgs: List[Dict[str, str]]) -> int:
     return sum(len(m.get("content", "")) for m in msgs)
 
 
-def build_transcript(thread_id: str, message: str) -> str:
+def build_transcript(thread_id: str, message: str, owner: Optional[str] = None) -> str:
     """Transkrip ringkas utk prompt: riwayat (terklip) + pesan user terakhir."""
-    history = clamp(thread_id)
+    history = clamp(thread_id, owner)
     lines = []
     for m in history:
         who = "User" if m.get("role") == "user" else "Asisten"

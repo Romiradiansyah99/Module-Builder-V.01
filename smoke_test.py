@@ -49,6 +49,24 @@ def step(name, func):
         print(f"      -> {exc}")
 
 
+def _client_owner(_cli):
+    """Id pemilik yang dipakai server untuk klien uji ini.
+
+    Riwayat percakapan privat per-browser (cookie kb_owner): sesi yang disemai
+    harus dicap pemilik yang sama, else semua endpoint thread-scoped membalas
+    404. Di deployment kb_owner diterbitkan malas oleh dependency require_auth,
+    jadi panggil satu endpoint dulu lalu dekode cookienya.
+    """
+    from tools.auth import DEV_OWNER, auth_configured, verify_owner_token
+
+    if not auth_configured():
+        return DEV_OWNER  # dev lokal: satu identitas tetap
+    _cli.get("/api/threads")  # memicu lazy-mint kb_owner
+    oid = verify_owner_token(_cli.cookies.get("kb_owner") or "")
+    assert oid, "kb_owner tidak terbit saat login - periksa require_auth"
+    return oid
+
+
 print("=" * 60)
 print("SMOKE TEST - Kemnaker AI Module Builder")
 print("=" * 60)
@@ -483,6 +501,9 @@ def t_gates_and_normalize():
 
         if auth_configured():
             _cli.cookies.set("kb_session", make_session_token())
+        # Riwayat kini privat per-pemilik: sesi yang disemai harus dicap
+        # pemilik yang sama dengan klien ini, else /api/approve membalas 404.
+        _srv.SESSIONS["smoke-t"]["owner"] = _client_owner(_cli)
         assert _cli.post("/api/approve/smoke-t",
                          json={"nama": "", "profesi": ""}).status_code == 400
         assert _cli.post("/api/approve/smoke-t",
@@ -624,6 +645,8 @@ def t_approve_http_ok():
         _cli = TestClient(_srv.app, raise_server_exceptions=False)
         if auth_configured():  # VPS: middleware auth menolak 401 lebih dulu
             _cli.cookies.set("kb_session", make_session_token())
+        # Sesi disemai harus milik klien ini (riwayat privat per-pemilik).
+        _srv.SESSIONS["smoke-9c"]["owner"] = _client_owner(_cli)
 
         _r = _cli.post("/api/approve/smoke-9c",
                        json={"nama": "Romi Putra", "profesi": "Instruktur",

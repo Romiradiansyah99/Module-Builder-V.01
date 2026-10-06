@@ -15,6 +15,7 @@ Env:
 
 import hashlib
 import os
+import secrets
 from pathlib import Path
 from typing import Optional
 
@@ -25,6 +26,19 @@ load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 COOKIE_NAME = "kb_session"
 _COOKIE_MAX_AGE = 30 * 24 * 3600  # 30 hari
+
+# ----------------------------------------------------------------------
+# IDENTITAS PRIVAT PER-BROWSER (kb_owner)
+# ----------------------------------------------------------------------
+# Cookie KEDUA yang menyimpan id acak tak-terka (riwayat percakapan dipakai
+# sebagai pemilik thread). Sengaja DIPISAH dari kb_session: logout harus
+# menghapus sesi login, tapi identitas HARUS bertahan supaya riwayat kembali
+# saat login lagi di browser yang sama. Ditandatangani SESSION_SECRET yang
+# sama tapi dengan SALT BERBEDA (pemisahan ranah: token sesi tak bisa
+# diputar-ulang jadi token pemilik) - jadi tidak perlu merotasi secret.
+OWNER_COOKIE_NAME = "kb_owner"
+_OWNER_COOKIE_MAX_AGE = 400 * 24 * 3600  # ~400 hari (plafon cookie Chrome)
+DEV_OWNER = "local-dev"  # identitas tunggal saat auth dimatikan (dev lokal)
 
 
 def _password_sha256() -> Optional[str]:
@@ -44,6 +58,14 @@ def _serializer() -> Optional[URLSafeTimedSerializer]:
     if not secret:
         return None
     return URLSafeTimedSerializer(secret, salt="kemnaker-module-builder")
+
+
+def _owner_serializer() -> Optional[URLSafeTimedSerializer]:
+    """Penanda tangan cookie identitas. Salt BEDA dari cookie sesi."""
+    secret = (os.getenv("SESSION_SECRET") or "").strip()
+    if not secret:
+        return None
+    return URLSafeTimedSerializer(secret, salt="kemnaker-owner")
 
 
 def auth_configured() -> bool:
@@ -88,4 +110,69 @@ def cookie_kwargs() -> dict:
         "secure": os.getenv("COOKIE_SECURE", "0").strip() == "1",
         "max_age": _COOKIE_MAX_AGE,
         "path": "/",
+    }
+
+
+# ----------------------------------------------------------------------
+# Cookie identitas (kb_owner) - privat per-browser, tahan logout
+# ----------------------------------------------------------------------
+
+
+def new_owner_id() -> str:
+    """Id identitas acak 256-bit - tak terka, tak diturunkan dari apa pun."""
+    return secrets.token_urlsafe(32)
+
+
+def make_owner_token(owner_id: str) -> str:
+    """Token cookie identitas (ditandatangani, bukan data sensitif)."""
+    return _owner_serializer().dumps({"owner": owner_id})
+
+
+def verify_owner_token(token: Optional[str]) -> Optional[str]:
+    """Kembalikan id pemilik dari token, atau None. Tak pernah melempar."""
+    if not token:
+        return None
+    try:
+        data = _owner_serializer().loads(token, max_age=_OWNER_COOKIE_MAX_AGE)
+    except (BadSignature, SignatureExpired, Exception):  # noqa: BLE001
+        return None
+    oid = data.get("owner")
+    return oid if isinstance(oid, str) and oid else None
+
+
+def owner_cookie_kwargs() -> dict:
+    """Atribut cookie identitas. Umurnya jauh lebih panjang dari sesi."""
+    return {
+        "key": OWNER_COOKIE_NAME,
+        "httponly": True,
+        "samesite": "lax",
+        "secure": os.getenv("COOKIE_SECURE", "0").strip() == "1",
+        "max_age": _OWNER_COOKIE_MAX_AGE,
+        "path": "/",
+    }
+
+
+def current_owner(request) -> Optional[str]:
+    """Id pemilik dari cookie permintaan ini (None bila belum ada)."""
+    return verify_owner_token(request.cookies.get(OWNER_COOKIE_NAME))
+
+
+def resolve_owner_for_login(request) -> str:
+    """Pakai ulang identitas browser bila ada; kalau tidak, buat yang baru.
+
+    Inilah yang membuat riwayat 'kembali' saat login lagi di browser sama."""
+    return current_owner(request) or new_owner_id()
+
+
+def clear_session_cookie_kwargs() -> dict:
+    """Atribut untuk MENGHAPUS cookie sesi saat logout.
+
+    kb_owner SENGAJA tidak disentuh - identitas harus bertahan agar riwayat
+    kembali saat login lagi."""
+    return {
+        "key": COOKIE_NAME,
+        "path": "/",
+        "httponly": True,
+        "samesite": "lax",
+        "secure": os.getenv("COOKIE_SECURE", "0").strip() == "1",
     }

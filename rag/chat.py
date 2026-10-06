@@ -11,7 +11,7 @@ Jawaban disusun dgn memori percakapan + konteks retrieve; streaming memakai
 _raw_chat_stream (bukan langchain invoke) supaya cancel & think-strip jalan.
 """
 
-from typing import Any, Callable, Dict, List
+from typing import Any, Callable, Dict, List, Optional
 
 from rag import config
 from rag import context as rag_context
@@ -26,12 +26,16 @@ def run_rag_chat(
     token_cb: Callable[[str], None],
     sources_cb: Callable[[List[Dict[str, Any]]], None],
     context_strategy: str = None,
+    owner: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Jalankan satu ronde RAG chat. Return {thread_id, answer, sources}."""
+    """Jalankan satu ronde RAG chat. Return {thread_id, answer, sources}.
+
+    owner = identitas pemanggil; riwayat percakapan di-namespace dengannya
+    (thread_id RAG datang dari klien, jadi bisa bertabrakan antar pengguna)."""
     from tools.llm_config import get_llm, get_llm_for_effort, _raw_chat_stream, _ThinkStream
 
-    threads.append_user(thread_id, message)
-    transcript = threads.build_transcript(thread_id, message)
+    threads.append_user(thread_id, message, owner)
+    transcript = threads.build_transcript(thread_id, message, owner)
 
     # --- 1) Rewrite (Rewrite-Retrieve-Read), fallback keras di dalam rewriter
     status_cb("Merapikan pertanyaan agar pencarian akurat…", "rag.rewrite")
@@ -85,7 +89,7 @@ def run_rag_chat(
         # cancel/error: jangan simpan asisten palsu; user message tetap tersimpan
         raise
 
-    threads.append_assistant(thread_id, answer)
+    threads.append_assistant(thread_id, answer, owner)
     return {"thread_id": thread_id, "answer": answer, "sources": sources}
 
 

@@ -57,6 +57,10 @@ def load() -> Dict[str, dict]:
             continue
         if sess.get("phase") == "producing":
             sess["phase"] = "approval"
+        # Sesi lama (era riwayat bersama) belum punya pemilik. Dibuat eksplisit
+        # None supaya server bisa menerapkan kebijakan: di produksi sesi lama
+        # TIDAK terlihat siapa pun (gagal-tertutup), di dev diadopsi DEV_OWNER.
+        sess.setdefault("owner", None)
         sessions[tid] = sess
     print(f"[session_store] {len(sessions)} sesi dimuat dari {path}")
     return sessions
