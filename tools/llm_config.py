@@ -27,12 +27,15 @@ _THINK_CLOSE = "</" + "think" + ">"
 
 
 def _strip_think(text: str) -> str:
-    """Buang blok thinking dari content glm-5.3-flash:cloud.
+    """Buang blok thinking yang ter-embed di `content` (perilaku glm-5.3).
 
-    Model ini mem-embed fase thinking langsung di `content` (walau think
-    dimatikan di request - perilaku proxy cloud). Blok tertutup memakai
-    tag penutup; bila terpotong, tag buka tampil tanpa penutup.
-    Cek tag penutup dulu - blok tertutup tetap mengandung tag buka.
+    Model aktif sekarang, deepseek-v4.1-flash:cloud, mengirim fase thinking di
+    FIELD TERPISAH (`message.thinking`) sehingga `content` sudah bersih -
+    terukur 2026-10-06: content 91 char, thinking 249 char, tanpa tag di
+    content. Fungsi ini jadi jaring pengaman tanpa efek (no-op) untuk model
+    itu, dan tetap bekerja bila suatu saat kembali ke model yang menempelkan
+    thinking di content (blok tertutup pakai tag penutup; bila terpotong, tag
+    buka tampil tanpa penutup - cek tag penutup dulu).
     """
     if _THINK_CLOSE in text:
         return text.rsplit(_THINK_CLOSE, 1)[-1].lstrip()
@@ -251,13 +254,16 @@ class ReplyRelay:
 
 
 # Preset effort LLM (ronde 3): satu tabel = policy biaya seluruh sistem.
-# Angka num_predict sesuai kondisi kerja terukur glm-5.3-flash:cloud.
-# Ronde 4 - routing cepat/berat: effort "low" (chat ringan) pakai model
-# flash cepat LLM_MODEL_FAST (terukur: dig 3.4-4.1s vs 6.3-6.5s glm-5.3);
-# kerja berat (silabus, konten modul) tetap model utama glm-5.3-flash.
+# Angka num_predict diwarisi dari pengukuran glm-5.3-flash:cloud (ronde 3-11b)
+# dan sengaja tetap longgar untuk model yang dipakai sekarang,
+# deepseek-v4.1-flash:cloud (Ollama Cloud) - batas atas, bukan target.
+# Ronde 4 - routing cepat/berat: effort "low" (chat ringan, dig Agent 1)
+# memakai LLM_MODEL_FAST; kerja berat (silabus, konten modul) memakai
+# LLM_MODEL. Keduanya kini model yang sama; memisahkannya tetap berguna
+# bila nanti mau model murah khusus percakapan.
 EFFORT_PRESETS = {
     "low":    {"temperature": 0.4, "num_predict": 4000,   # percakapan dig (reply pendek)
-               "model": os.getenv("LLM_MODEL_FAST", "deepseek-v4-flash:cloud")},
+               "model": os.getenv("LLM_MODEL_FAST", "deepseek-v4.1-flash:cloud")},
     "medium": {"temperature": 0.1, "num_predict": 8000, "model": None},   # evaluator (kaku)
     "high":   {"temperature": 0.3, "num_predict": 16000, "model": None},  # agent1 build (JSON silabus)
     # Ronde 11b: draf produksi nyata terukur >60k char - 24000 token
@@ -387,7 +393,7 @@ def get_llm(temperature: float = 0.3, num_predict: Optional[int] = None, model: 
 
     api_key = os.getenv("LLM_API_KEY", "")
     params = {
-        "model": model or os.getenv("LLM_MODEL", "glm-5.3-flash:cloud"),
+        "model": model or os.getenv("LLM_MODEL", "deepseek-v4.1-flash:cloud"),
         "base_url": os.getenv("LLM_BASE_URL", "http://localhost:11434"),
         "temperature": temperature,
     }
