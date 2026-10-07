@@ -6,7 +6,7 @@ Jalankan:  python smoke_test.py            (tanpa LLM: infrastruktur saja)
 
 Langkah yang dites:
  1. Config .env termuat benar
- 2. Koneksi LLM (ChatOllama) - chat ping
+ 2. Koneksi LLM (provider aktif di .env) - chat ping
  3. Koneksi embedding cloud (kandidat model otomatis)
  4. Ingest RAG SKKNI (skip jika sudah ada index)
  5. Retrieve SKKNI bekerja
@@ -102,7 +102,7 @@ def t_llm():
     print(f"      Respons: {r.content[:100]}")
 
 
-step("2. Koneksi LLM (ChatOllama)", t_llm)
+step("2. Koneksi LLM (provider aktif)", t_llm)
 
 
 # --- 3. Embedding cloud ------------------------------------------------

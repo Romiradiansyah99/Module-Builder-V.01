@@ -1,7 +1,8 @@
 # DEPLOY.md — Kemnaker Module Builder di VPS (Docker)
 
-Panduan deployment tim: VPS cloud Linux + Docker, LLM via API ollama.com
-(API key, tanpa Ollama desktop), login **kata sandi tunggal**.
+Panduan deployment tim: VPS cloud Linux + Docker, LLM via API CommandCode
+(endpoint OpenAI-compatible, API key, tanpa runtime LLM lokal), login
+**kata sandi tunggal**.
 
 ---
 
@@ -52,9 +53,10 @@ Yang **wajib** diisi/dicek di `.env` VPS:
 
 | Variabel | Nilai | Catatan |
 |---|---|---|
-| `LLM_BASE_URL` | `https://ollama.com` | API ollama.com langsung |
+| `LLM_BASE_URL` | `https://api.commandcode.ai/provider/v1` | endpoint OpenAI-compatible CommandCode (`/chat/completions`). Host non-Ollama otomatis memakai mode ini |
 | `LLM_API_KEY` | **key BARU (dirotasi)** | key lama pernah plaintext di repo lokal — jangan dipakai ulang |
-| `LLM_MODEL` | `deepseek-v4.1-flash:cloud` | model yang sudah **di-retire** menjawab `HTTP 410 Gone` → dig Agent 1 mati senyap (fallback deterministik). ❗ `/api/tags` **tidak bisa dipercaya**: `deepseek-v4-flash:cloud` masih terdaftar di sana padahal di-retire 2026-09-25. Uji dengan panggilan nyata (lihat bawah) |
+| `LLM_MODEL` | `deepseek/deepseek-v4.1-flash` | nama model persis seperti yang dikenali CommandCode. Model tak dikenal menjawab `HTTP 4xx` → dig Agent 1 mati senyap (fallback deterministik). Uji dengan panggilan nyata (lihat bawah) |
+| `LLM_MODEL_FAST` | `deepseek/deepseek-v4.1-flash` | model chat ringan (effort "low", dig Agent 1) |
 | `EMBEDDING_MODEL` | **KOSONG** | ❗ wajib kosong — index chroma_db dibangun dengan MiniLM lokal; embedder remote = RAG rusak senyap |
 | `REPLICATE_API_TOKEN` | token dari replicate.com | ❗ tanpa ini **semua gambar** jatuh ke pencarian gambar internet dan cover tetap foto template |
 | `REPLICATE_MODEL` | `black-forest-labs/flux-schnell` | model **subbab** (banyak gambar/modul) — ~$0.003/gambar, ~11× lebih murah dari nano-banana. **Skema input BEDA per keluarga** — lihat catatan di bawah |
@@ -64,13 +66,13 @@ Yang **wajib** diisi/dicek di `.env` VPS:
 | `SESSION_SECRET` | `openssl rand -hex 32` | |
 | `COOKIE_SECURE` | `1` setelah HTTPS aktif | |
 
-Cek cepat bahwa **model LLM** benar-benar hidup — jangan pakai `/api/tags`, uji dengan
-panggilan nyata. Ganti `MODEL` dengan `LLM_MODEL` di `.env`; `HTTP 200` = aman, `410` = sudah
-di-retire (ganti ke model lain, mis. `glm-5.3:cloud`):
+Cek cepat bahwa **model LLM** benar-benar hidup — uji dengan panggilan nyata.
+Ganti `MODEL` dengan `LLM_MODEL` di `.env`; `HTTP 200` = aman, `4xx` = model/key
+salah (periksa nama model & `LLM_API_KEY`):
 
 ```bash
-curl -s -o /dev/null -w "%{http_code}\n" "$LLM_BASE_URL/api/chat" \
-  -H 'Content-Type: application/json' \
+curl -s -o /dev/null -w "%{http_code}\n" "$LLM_BASE_URL/chat/completions" \
+  -H "Authorization: Bearer $LLM_API_KEY" -H 'Content-Type: application/json' \
   -d '{"model":"MODEL","messages":[{"role":"user","content":"ok"}],"stream":false}'
 ```
 
@@ -296,8 +298,9 @@ Semua state yang selamat restart ada di `/opt/kemnaker/runtime/`:
 | `/healthz` gagal di healthcheck | ingest RAG pertama masih berjalan | tunggu (start-period 90s); cek `docker compose logs` |
 | Login kembali setiap saat | `SESSION_SECRET` berubah tiap restart | pastikan SESSION_SECRET tetap di `.env` |
 | SSE terasa macet di depan proxy | buffering | Caddy: `flush_interval -1` |
-| Key ditolak (401 dari ollama.com) | key lama dirotasi/mati | perbarui `LLM_API_KEY` di `.env`, `docker compose up -d` |
-| Dig Agent 1 balas template kaku, log `410 Gone` | `LLM_MODEL` sudah di-retire di proxy | uji dengan panggilan nyata di bawah, lalu set `LLM_MODEL` ke model yang menjawab **200**. ❗ Jangan pakai `curl $LLM_BASE_URL/api/tags` sebagai bukti: model yang sudah di-retire masih muncul di daftar itu |
+| Key ditolak (401 dari `api.commandcode.ai`) | key salah/dirotasi/mati | perbarui `LLM_API_KEY` di `.env`, `docker compose up -d` |
+| Dig Agent 1 balas template kaku, log `4xx` | `LLM_MODEL` tidak dikenal endpoint | uji dengan panggilan nyata di atas, lalu set `LLM_MODEL` ke model yang menjawab **200** |
+| RAG chat/typing diam, log `404 /api/chat` | mode provider salah terdeteksi | pastikan `LLM_BASE_URL` menunjuk host non-Ollama (mis. `api.commandcode.ai`) lalu `docker compose up -d` |
 | **Gambar modul bukan hasil AI** (foto internet / ber-watermark) | `REPLICATE_API_TOKEN` kosong, atau `IMAGE_MODE` bukan `replicate`, atau kredit habis | cek log `[image_gen] Replicate submit gagal (...)`; `docker compose exec app python tools/image_verify.py --live` |
 | Cover masih foto template | `IMAGE_COVER_MODE=template`, kredit habis, atau gangguan jaringan sesaat saat submit cover | pastikan `IMAGE_COVER_MODE=replicate` + kredit cukup. Gangguan jaringan (log: `gangguan jaringan (ConnectTimeout) - ulangi 2/3`) kini diulang otomatis `IMAGE_NET_RETRIES` (default 3); kalau log berakhir `Cover Replicate tidak tersedia`, generate-nya memang gagal total. Verifikasi hasil: `image_verify.py --docx output/X.docx` |
 | Satu-dua gambar subbab jadi foto internet/ber-watermark | Replicate gagal setelah semua retry, jatuh ke jaring pengaman pencarian gambar (log: `Gambar internet OK (wikimedia)`) | lihat baris log tepat sebelum itu untuk sebabnya (`HTTP 402` = kredit, `HTTP 429` = rate limit, `gangguan jaringan` = jaringan). Naikkan `IMAGE_NET_RETRIES` bila jaringannya memang buruk |

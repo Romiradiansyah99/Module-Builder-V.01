@@ -21,3 +21,6 @@ database/chroma_db/
 # OS
 Thumbs.db
 .DS_Store
+
+# Perkakas agen lokal (settings + catatan taste)
+.commandcode/

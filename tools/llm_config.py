@@ -1,12 +1,17 @@
 """
-LLM FACTORY - ChatOllama terhubung ke cloud API
+LLM FACTORY - satu titik keluar ke provider LLM
 ================================================
 Semua agent mengambil LLM dari sini. Endpoint & model dikendalikan .env:
 - LLM_BASE_URL, LLM_MODEL, LLM_API_KEY
 
-Bisa menunjuk ke Ollama lokal (proxy model :cloud) atau langsung ke
-https://ollama.com / provider Ollama-compatible lain — cukup ubah .env,
-tanpa menyentuh kode agent.
+Dua mode, dipilih otomatis dari LLM_BASE_URL:
+- Native Ollama (/api/chat): base_url lokal (localhost/127.0.0.1) atau
+  mengandung "ollama" (mis. https://ollama.com) -> ChatOllama.
+- OpenAI-compatible (/chat/completions): endpoint lain, mis.
+  https://api.commandcode.ai/provider/v1 (CommandCode) -> httpx langsung.
+
+Chat maupun streaming mengikuti mode yang sama, jadi berpindah provider
+cukup dengan mengubah .env tanpa menyentuh kode agent.
 """
 
 import os
@@ -254,16 +259,16 @@ class ReplyRelay:
 
 
 # Preset effort LLM (ronde 3): satu tabel = policy biaya seluruh sistem.
-# Angka num_predict diwarisi dari pengukuran glm-5.3-flash:cloud (ronde 3-11b)
-# dan sengaja tetap longgar untuk model yang dipakai sekarang,
-# deepseek-v4.1-flash:cloud (Ollama Cloud) - batas atas, bukan target.
+# Angka num_predict diwarisi dari pengukuran model sebelumnya (glm-5.3-flash,
+# ronde 3-11b) dan sengaja tetap longgar untuk model yang dipakai sekarang,
+# deepseek/deepseek-v4.1-flash (CommandCode) - batas atas, bukan target.
 # Ronde 4 - routing cepat/berat: effort "low" (chat ringan, dig Agent 1)
 # memakai LLM_MODEL_FAST; kerja berat (silabus, konten modul) memakai
 # LLM_MODEL. Keduanya kini model yang sama; memisahkannya tetap berguna
 # bila nanti mau model murah khusus percakapan.
 EFFORT_PRESETS = {
     "low":    {"temperature": 0.4, "num_predict": 4000,   # percakapan dig (reply pendek)
-               "model": os.getenv("LLM_MODEL_FAST", "deepseek-v4.1-flash:cloud")},
+               "model": os.getenv("LLM_MODEL_FAST", "deepseek/deepseek-v4.1-flash")},
     "medium": {"temperature": 0.1, "num_predict": 8000, "model": None},   # evaluator (kaku)
     "high":   {"temperature": 0.3, "num_predict": 16000, "model": None},  # agent1 build (JSON silabus)
     # Ronde 11b: draf produksi nyata terukur >60k char - 24000 token
@@ -379,46 +384,59 @@ def get_llm_usage() -> dict:
     return {k: dict(v) for k, v in _USAGE.items()}
 
 
-def get_llm(temperature: float = 0.3, num_predict: Optional[int] = None, model: Optional[str] = None):
-    """Buat instance ChatOllama sesuai konfigurasi .env.
+def _uses_ollama_native(base_url: str) -> bool:
+    """True bila base_url menunjuk server Ollama native (/api/chat).
 
-    Args:
-        temperature: 0.1-0.2 untuk evaluator (kaku), 0.3-0.5 untuk writer.
-        num_predict: batas token output (None = biarkan default server).
-        model: override nama model (None = LLM_MODEL dari .env). Dipakai
-            routing cepat/berat ronde 4: chat ringan pakai model flash cepat,
-            kerja berat pakai model utama.
+    Selain itu dianggap OpenAI-compatible (/chat/completions) - mis.
+    https://api.commandcode.ai/provider/v1. Satu fungsi agar _raw_chat,
+    _raw_chat_stream, dan get_llm tidak pernah berbeda pendapat soal mode.
     """
-    from langchain_ollama import ChatOllama
+    return any(h in (base_url or "").lower() for h in ("localhost", "127.0.0.1", "ollama"))
+
+
+def get_llm(temperature: float = 0.3, num_predict: Optional[int] = None, model: Optional[str] = None):
+    """Buat instance LLM sesuai konfigurasi .env.
+
+    Mode native Ollama (ChatOllama) atau OpenAI-compatible (SimpleNamespace
+    yang memanggil /chat/completions lewat httpx) dipilih dari LLM_BASE_URL.
+    """
+    from types import SimpleNamespace
 
     api_key = os.getenv("LLM_API_KEY", "")
-    params = {
-        "model": model or os.getenv("LLM_MODEL", "deepseek-v4.1-flash:cloud"),
-        "base_url": os.getenv("LLM_BASE_URL", "http://localhost:11434"),
-        "temperature": temperature,
-    }
-    if num_predict:
-        params["num_predict"] = num_predict
-    if api_key:
-        # Provider cloud (mis. ollama.com) butuh Bearer token.
-        # Ollama lokal mengabaikan header ini — aman selalu dikirim.
-        params["client_kwargs"] = {"headers": {"Authorization": f"Bearer {api_key}"}}
+    base_url = os.getenv("LLM_BASE_URL", "http://localhost:11434")
+    selected_model = model or os.getenv("LLM_MODEL", "deepseek/deepseek-v4.1-flash")
 
-    llm = ChatOllama(**params)
+    if _uses_ollama_native(base_url):
+        from langchain_ollama import ChatOllama
 
-    # glm-5.2:cloud adalah reasoning model: fase "thinking" memakan budget
-    # num_predict secara DIAM - budget kecil menghasilkan konten kosong.
-    # PENTING utk glm-5.3-flash:cloud: JANGAN set reasoning=False. Terukur di
-    # mesin ini: dengan think:false, langchain-ollama menghapus TAG think tapi
-    # MENINGGALKAN teks thinking bercampur di content; dengan default (tanpa
-    # think:false), content datang bersih. Jadi reasoning=False hanya utk 5.2.
-    model_name = params["model"]
-    if model_name.startswith("glm-5.2") and hasattr(llm, "reasoning"):
-        try:
-            llm.reasoning = False
-        except Exception:  # noqa: BLE001 - provider lama tanpa dukungan think
-            pass
+        params = {
+            "model": selected_model,
+            "base_url": base_url,
+            "temperature": temperature,
+        }
+        if num_predict:
+            params["num_predict"] = num_predict
+        if api_key:
+            params["client_kwargs"] = {"headers": {"Authorization": f"Bearer {api_key}"}}
 
+        llm = ChatOllama(**params)
+
+        model_name = params["model"]
+        if model_name.startswith("glm-5.2") and hasattr(llm, "reasoning"):
+            try:
+                llm.reasoning = False
+            except Exception:  # noqa: BLE001 - provider lama tanpa dukungan think
+                pass
+        return llm
+
+    llm = SimpleNamespace(
+        model=selected_model,
+        base_url=base_url,
+        temperature=temperature,
+        num_predict=num_predict,
+        _provider="openai",
+    )
+    llm.invoke = lambda prompt, _llm=llm: _raw_chat(_llm, prompt)
     return llm
 
 
@@ -455,16 +473,10 @@ def _ollama_prompt(llm, prompt: str) -> str:
 
 
 def _raw_chat(llm, prompt: str):
-    """Panggil /api/chat proxy ollama secara LANGSUNG via httpx.
+    """Panggil endpoint provider sesuai tipe LLM (Ollama atau OpenAI-compatible)."""
+    if getattr(llm, "_provider", None) == "openai":
+        return _raw_chat_openai(llm, prompt)
 
-    Kenapa dua lapis masalahnya:
-    1. langchain-ollama (think:false): menghapus TAG think tapi meninggalkan
-       teks thinking bercampur jawaban - tak bisa dipisah.
-    2. ollama python Client: kwarg `think` TIDAK dikirim ke proxy (versi lama)
-       -> model berpikir bebas berbelitan belasan ribu token tanpa tag.
-    Dengan POST httpx + "think": false, proxy menyetel thinking PENDEK dan
-    menyertakan tag penutup di content -> _strip_think() membuangnya bersih.
-    """
     from types import SimpleNamespace
 
     import httpx
@@ -483,6 +495,112 @@ def _raw_chat(llm, prompt: str):
     return SimpleNamespace(content=(d.get("message") or {}).get("content") or "", response_metadata=meta)
 
 
+def _raw_chat_openai(llm, prompt: str):
+    """Panggil endpoint OpenAI-compatible (mis. CommandCode) via /chat/completions."""
+    from types import SimpleNamespace
+
+    import httpx
+
+    payload = {
+        "model": llm.model,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": float(getattr(llm, "temperature", 0.2) or 0.2),
+        "stream": False,
+    }
+    if getattr(llm, "num_predict", None) is not None:
+        payload["max_tokens"] = int(llm.num_predict)
+
+    url = str(llm.base_url).rstrip("/") + "/chat/completions"
+    headers = {"Authorization": f"Bearer {os.getenv('LLM_API_KEY', '')}"}
+    r = httpx.post(url, json=payload, headers=headers, timeout=600)
+    r.raise_for_status()
+    d = r.json()
+    choice = (d.get("choices") or [{}])[0]
+    message = choice.get("message") or {}
+    # reasoning_content (mis. deepseek) adalah fase thinking TERPISAH - bukan
+    # jawaban. Sengaja TIDAK dijadikan fallback: konten kosong dibiarkan kosong
+    # agar invoke_with_retry menaikkan budget, bukan mengembalikan thinking
+    # mentah ke parser agent.
+    content = message.get("content") or ""
+    usage = d.get("usage") or {}
+    meta = {
+        "eval_count": usage.get("completion_tokens") or usage.get("total_tokens"),
+        "done_reason": choice.get("finish_reason"),
+    }
+    return SimpleNamespace(content=content, response_metadata=meta)
+
+
+def _raw_chat_stream_openai(llm, prompt: str, on_text):
+    """Streaming endpoint OpenAI-compatible (SSE `data: {...}`, mis. CommandCode).
+
+    Hanya delta `content` yang diteruskan ke on_text; `reasoning_content`
+    (fase thinking model seperti deepseek) dan baris `[DONE]` diabaikan.
+    Return objek berinterface sama dengan _raw_chat_openai.
+    """
+    import json as _json
+    from types import SimpleNamespace
+
+    import httpx
+
+    payload = {
+        "model": llm.model,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": float(getattr(llm, "temperature", 0.2) or 0.2),
+        "stream": True,
+    }
+    if getattr(llm, "num_predict", None) is not None:
+        payload["max_tokens"] = int(llm.num_predict)
+
+    url = str(llm.base_url).rstrip("/") + "/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {os.getenv('LLM_API_KEY', '')}",
+        "Accept": "text/event-stream",
+    }
+    parts = []
+    stripper = _ThinkStream()
+    meta = {}
+    # httpx.post() membaca body penuh dulu - streaming WAJIB lewat Client.stream.
+    with httpx.Client(timeout=600) as client:
+        with client.stream("POST", url, json=payload, headers=headers) as r:
+            r.raise_for_status()
+            for line in r.iter_lines():
+                # Ronde 14: cek cancel per baris - Stop dari UI memutus stream
+                # KE PROVIDER di sini (koneksi ditutup context manager).
+                if _cancelled():
+                    raise GenerationCancelled()
+                line = line.strip()
+                if not line:
+                    continue
+                if line.startswith("data:"):
+                    line = line[len("data:"):].strip()
+                if not line or line == "[DONE]":
+                    continue
+                try:
+                    d = _json.loads(line)
+                except ValueError:
+                    continue
+                choices = d.get("choices") or []
+                if not choices:
+                    continue
+                choice = choices[0]
+                delta = choice.get("delta") or {}
+                piece = delta.get("content")
+                if piece:
+                    parts.append(piece)
+                    vis = stripper.feed(piece)
+                    if vis:
+                        on_text(vis)
+                if choice.get("finish_reason"):
+                    meta["done_reason"] = choice["finish_reason"]
+                usage = d.get("usage")
+                if usage:
+                    meta["eval_count"] = usage.get("completion_tokens") or usage.get("total_tokens")
+    vis = stripper.flush()
+    if vis:
+        on_text(vis)
+    return SimpleNamespace(content="".join(parts), response_metadata=meta)
+
+
 def _raw_chat_stream(llm, prompt: str, on_text):
     """Sama dengan _raw_chat tapi stream=True (ronde 4): setiap delta content
     yang sudah bebas thinking diteruskan ke on_text. Dipakai utk panggilan
@@ -492,6 +610,9 @@ def _raw_chat_stream(llm, prompt: str, on_text):
     Return objek berinterface sama dengan _raw_chat (content mentah + metadata)
     sehingga seluruh jalur retry/auto-bump/usage di invoke_with_retry tetap jalan.
     """
+    if getattr(llm, "_provider", None) == "openai":
+        return _raw_chat_stream_openai(llm, prompt, on_text)
+
     import json as _json
     from types import SimpleNamespace
 
@@ -540,23 +661,31 @@ def _raw_chat_stream(llm, prompt: str, on_text):
 
 
 def _is_chatollama(llm) -> bool:
-    return bool(getattr(llm, "base_url", None) and getattr(llm, "model", None))
+    if getattr(llm, "_provider", None) == "openai":
+        return False
+    return bool(getattr(llm, "base_url", None) and getattr(llm, "model", None) and type(llm).__module__.startswith("langchain_ollama"))
+
+
+def _is_streamable(llm) -> bool:
+    """True utk kedua mode yang punya implementasi _raw_chat_stream sendiri:
+    ChatOllama native maupun provider OpenAI-compatible."""
+    return _is_chatollama(llm) or getattr(llm, "_provider", None) == "openai"
 
 
 def invoke_with_retry(llm, prompt: str, attempts: int = 5, base_delay: float = 2.0, label: str = ""):
     """Panggil llm.invoke dengan retry + backoff untuk error jaringan transient.
 
-    Cloud endpoint (ollama.com / proxy lokal) bisa time out sesaat — satu error
-    jaringan tidak boleh membatalkan seluruh batch modul. Error terakhir tetap
-    dilempar supaya node/graph bisa melaporkannya.
+    Endpoint cloud (CommandCode / ollama.com / proxy lokal) bisa time out
+    sesaat — satu error jaringan tidak boleh membatalkan seluruh batch modul.
+    Error terakhir tetap dilempar supaya node/graph bisa melaporkannya.
     Ronde 6: default 5 attempt (backoff 2/4/8/16s ~ 30s total) - 3 attempt
     dulu tak cukup utk 502 Bad Gateway proxy cloud yang berlangsung >10 detik
     (terukur 2026-09-07 menggagalkan smoke --full di tahap agent3).
 
-    Khusus glm-5.3-flash:cloud: fase thinking menghabiskan budget num_predict
-    sebelum jawaban tercetak (terukur: prompt 15k chars butuh >12k token thinking
-    saja) -> konten kosong/"..." dengan done_reason="length". Bila itu terjadi,
-    num_predict dilipatgandakan sekali dan dipanggil ulang.
+    Model reasoning (mis. deepseek-v4.1-flash) menghabiskan budget num_predict
+    untuk fase thinking sebelum jawaban tercetak -> konten kosong dengan
+    done_reason="length". Bila itu terjadi, num_predict dilipatgandakan sekali
+    dan dipanggil ulang.
     """
     import time
 
@@ -579,7 +708,7 @@ def invoke_with_retry(llm, prompt: str, attempts: int = 5, base_delay: float = 2
             # Baca sink TIAP attempt (bukan cached): sink sekali-pakai sudah
             # di-clear dari thread-local setelah pemakaian pertama.
             sink = get_stream_sink()
-            if sink is not None and _is_chatollama(llm):
+            if sink is not None and _is_streamable(llm):
                 # Sink biasa sekali pakai: hanya panggilan LLM pertama di thread
                 # ini yang dialirkan (percakapan dig / reply build). Retry &
                 # panggilan berikutnya non-stream - hasil final selalu dari
@@ -591,7 +720,10 @@ def invoke_with_retry(llm, prompt: str, attempts: int = 5, base_delay: float = 2
                 on_text = sink.feed if hasattr(sink, "feed") else sink
                 response = _raw_chat_stream(llm, prompt, on_text)
             else:
-                response = _raw_chat(llm, prompt) if _is_chatollama(llm) else llm.invoke(prompt)
+                if _is_streamable(llm):
+                    response = _raw_chat(llm, prompt)
+                else:
+                    response = llm.invoke(prompt)
             content = response.content if isinstance(response.content, str) else ""
             meta = response.response_metadata or {}
             # Terpotong di tengah thinking (belum ada tag tutup) atau konten
@@ -632,4 +764,6 @@ def invoke_with_retry(llm, prompt: str, attempts: int = 5, base_delay: float = 2
                 delay = base_delay * (2**attempt)
                 print(f"[llm_retry] attempt {attempt + 1}/{attempts} gagal ({exc}); retry {delay:.0f}s")
                 time.sleep(delay)
-    raise last_exc
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError("LLM request failed without a captured exception")

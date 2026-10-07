@@ -2,7 +2,7 @@
 RAG CHAT - percakapan tanya-jawab atas dokumen (Kemnaker)
 ==========================================================
 Pola Rewrite-Retrieve-Read ala rag-chatbot, diadaptasi ke infra yang sudah
-ada: LLM Ollama Cloud (tools/llm_config), embedder (tools/vector_store),
+ada: LLM dari provider di .env (tools/llm_config), embedder (tools/vector_store),
 dan vector store Chroma. Menyediakan:
 
   rag/chat.py        -> orchestrator streaming jawaban (dipakai server.py)
